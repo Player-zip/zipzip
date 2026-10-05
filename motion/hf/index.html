@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <script src="assets/gsap.min.js"></script>
+    <script src="data.js"></script>
+    <style>
+      @font-face { font-family: "Geist"; src: url("assets/fonts/Geist-Variable.woff2") format("woff2"); font-weight: 100 900; }
+      @font-face { font-family: "Geist Mono"; src: url("assets/fonts/GeistMono-Medium.woff2") format("woff2"); font-weight: 500; }
+      :root {
+        --g: #22d46a;        /* accent: verde no lugar do laranja */
+        --g-hi: #6bf5a1;
+        --g-deep: #0b6f35;
+        --ink: #0b0b0b;
+        --ink-2: #141815;
+        --paper: #f4f2ee;
+        --mute: #a5b0a9;
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 1920px; height: 1080px; overflow: hidden; background: #000; }
+      body { font-family: "Geist", system-ui, sans-serif; color: #fff; -webkit-font-smoothing: antialiased; }
+      #root { position: absolute; inset: 0; overflow: hidden; }
+      .clip { position: absolute; }
+      .layer { position: absolute; inset: 0; width: 1920px; height: 1080px; pointer-events: none; }
+      #shake { transform-origin: 50% 50%; }
+      #cam { transform-origin: 0 0; }
+      #base { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; }
+      .mono { font-family: "Geist Mono", ui-monospace, monospace; font-weight: 500; }
+      .hide { opacity: 0; visibility: hidden; }
+
+      /* ---------- shared components ---------- */
+      .pill {
+        position: absolute; display: inline-flex; align-items: center; gap: 18px;
+        background: rgba(11, 11, 11, 0.9); border-radius: 999px; padding: 18px 34px 18px 24px;
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35), inset 0 0 0 2px rgba(34, 212, 106, 0.35);
+        white-space: nowrap;
+      }
+      .dot { width: 18px; height: 18px; border-radius: 50%; background: var(--g); box-shadow: 0 0 0 6px rgba(34, 212, 106, 0.22); flex: none; }
+      .big { font-weight: 800; font-size: 56px; letter-spacing: -0.025em; line-height: 1; text-transform: uppercase; }
+      .stack { display: grid; }
+      .stack > * { grid-area: 1 / 1; }
+      .hl { position: relative; isolation: isolate; color: var(--ink); padding: 0 12px; margin: 0 -2px; }
+      .hl::before { content: ""; position: absolute; inset: -6px 0; background: var(--g); border-radius: 10px; z-index: -1; transform-origin: 0 50%; transform: scaleX(var(--hx, 0)); }
+      .hl > span { position: relative; }
+      .card {
+        position: absolute; background: rgba(11, 11, 11, 0.9); border-radius: 30px; padding: 26px 34px 28px;
+        box-shadow: 0 22px 50px rgba(0, 0, 0, 0.4), inset 0 0 0 2px rgba(34, 212, 106, 0.3);
+      }
+      .kicker { font-family: "Geist Mono", monospace; font-size: 24px; letter-spacing: 0.14em; color: var(--g); text-transform: uppercase; }
+      .tag {
+        position: absolute; display: inline-flex; align-items: center; gap: 12px; white-space: nowrap;
+        background: var(--g); color: var(--ink); border-radius: 999px; padding: 10px 22px;
+        font-weight: 800; font-size: 30px; letter-spacing: -0.01em; text-transform: uppercase;
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35);
+      }
+      .ring {
+        position: absolute; border-radius: 50%; border: 7px solid var(--g);
+        box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.35), inset 0 0 0 3px rgba(0, 0, 0, 0.25);
+      }
+      .box {
+        position: absolute; border-radius: 22px; border: 6px solid var(--g);
+        box-shadow: 0 0 0 3px rgba(0, 0, 0, 0.35);
+      }
+      .brk { position: absolute; width: 46px; height: 46px; border-color: var(--g); border-style: solid; border-width: 0; filter: drop-shadow(0 0 3px rgba(0,0,0,.6)); }
+      .brk.tl { left: 0; top: 0; border-left-width: 8px; border-top-width: 8px; border-top-left-radius: 14px; }
+      .brk.tr { right: 0; top: 0; border-right-width: 8px; border-top-width: 8px; border-top-right-radius: 14px; }
+      .brk.bl { left: 0; bottom: 0; border-left-width: 8px; border-bottom-width: 8px; border-bottom-left-radius: 14px; }
+      .brk.br { right: 0; bottom: 0; border-right-width: 8px; border-bottom-width: 8px; border-bottom-right-radius: 14px; }
+      .icon { width: 44px; height: 44px; flex: none; stroke: currentColor; fill: none; stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }
+
+      /* ---------- specific elements ---------- */
+      #hook { left: 96px; top: 84px; }
+      #ringLbl { font-size: 26px; padding: 8px 18px; }
+      #gwMark { position: absolute; left: 772px; top: 497px; width: 142px; height: 32px; border-radius: 8px; border: 3px solid var(--g); box-shadow: 0 0 0 2px rgba(0,0,0,.4); }
+      #gwLine { position: absolute; left: 776px; top: 528px; width: 134px; height: 5px; border-radius: 3px; background: var(--g); transform-origin: 0 50%; }
+      #gwCard { left: 96px; top: 84px; }
+      #gwCard .t { font-weight: 800; font-size: 60px; letter-spacing: -0.03em; text-transform: uppercase; margin-top: 8px; }
+      #gwCard .s { font-size: 26px; color: var(--mute); margin-top: 12px; }
+      .bar { position: absolute; left: 0; width: 1920px; height: 120px; background: #000; }
+      #barT { top: 0; } #barB { bottom: 0; }
+      #chap { left: 96px; bottom: 150px; padding-left: 44px; }
+      #chap::before { content: ""; position: absolute; left: 22px; top: 26px; bottom: 28px; width: 7px; border-radius: 4px; background: var(--g); }
+      #chap .t { font-weight: 800; font-size: 64px; letter-spacing: -0.03em; text-transform: uppercase; margin-top: 10px; display: flex; align-items: center; gap: 18px; }
+      #me svg { position: absolute; overflow: visible; }
+      #meTag { font-size: 34px; }
+      #mkLbl { font-size: 28px; }
+      .chip { position: absolute; width: 40px; height: 40px; border-radius: 50%; background: var(--g); color: var(--ink); font-weight: 800; font-size: 24px; display: grid; place-items: center; box-shadow: 0 4px 12px rgba(0,0,0,.4); }
+      #banBox { position: absolute; }
+      #banTag { font-size: 24px; padding: 8px 16px; }
+      #qi {
+        position: absolute; left: 0; width: 1920px; top: 700px; text-align: center;
+        font-weight: 900; font-size: 150px; letter-spacing: -0.04em; color: var(--g);
+        -webkit-text-stroke: 14px var(--ink); paint-order: stroke fill; text-transform: uppercase;
+        filter: drop-shadow(0 14px 0 rgba(0, 0, 0, 0.35));
+      }
+      #flash { background: #fff; }
+      #rate { left: 96px; top: 84px; width: 560px; }
+      #rate .t { font-weight: 800; font-size: 50px; letter-spacing: -0.03em; text-transform: uppercase; margin-top: 10px; }
+      .meter { display: flex; gap: 10px; margin-top: 18px; }
+      .meter i { flex: 1; height: 16px; border-radius: 8px; background: rgba(255, 255, 255, 0.14); position: relative; overflow: hidden; }
+      .meter i b { position: absolute; inset: 0; background: var(--g); transform-origin: 0 50%; transform: scaleX(0); }
+      #waves { left: 120px; top: 290px; }
+      #waves .t { font-weight: 800; font-size: 52px; letter-spacing: -0.03em; text-transform: uppercase; margin-top: 10px; display: flex; align-items: center; gap: 18px; }
+      #waves .t .icon { color: var(--g); width: 50px; height: 50px; }
+      #toast { left: 120px; top: 290px; width: 660px; display: flex; gap: 24px; align-items: flex-start; border-radius: 28px; padding: 24px 30px; }
+      #toast .ic { width: 72px; height: 72px; border-radius: 20px; background: var(--g); color: var(--ink); display: grid; place-items: center; flex: none; }
+      #toast .ic .icon { width: 42px; height: 42px; stroke-width: 3; }
+      #toast .h { display: flex; justify-content: space-between; align-items: baseline; }
+      #toast .h b { font-size: 30px; font-weight: 800; letter-spacing: 0.02em; }
+      #toast .h span { font-size: 22px; color: var(--mute); }
+      #toast p { font-size: 30px; line-height: 1.25; margin-top: 6px; color: #e9ece9; }
+      /* full-frame b-roll cutaway */
+      #cut { background: #0c0f0d; }
+      #cut .grid { position: absolute; inset: 0; background-image: radial-gradient(rgba(255,255,255,.08) 2px, transparent 2.5px); background-size: 48px 48px; }
+      #cut .kick { position: absolute; left: 0; width: 1920px; top: 250px; text-align: center; }
+      #ban {
+        position: absolute; left: 510px; top: 300px; width: 900px; height: 460px; border-radius: 40px; background: var(--paper); color: var(--ink);
+        box-shadow: 0 40px 90px rgba(0, 0, 0, 0.55); padding: 48px 52px;
+      }
+      #ban .who { display: flex; align-items: center; gap: 28px; }
+      #ban .av { width: 120px; height: 120px; border-radius: 34px; background: var(--ink); color: var(--g); display: grid; place-items: center; }
+      #ban .av .icon { width: 70px; height: 70px; stroke-width: 2.4; }
+      #ban .nm { font-size: 58px; font-weight: 800; letter-spacing: -0.03em; }
+      #ban .sub { font-size: 24px; color: #6b716d; margin-top: 6px; }
+      #ban .st { position: absolute; right: 52px; top: 60px; }
+      #ban .st > div { display: inline-flex; align-items: center; gap: 12px; padding: 12px 22px; border-radius: 999px; font-weight: 800; font-size: 26px; text-transform: uppercase; white-space: nowrap; justify-self: end; }
+      #stOk { background: rgba(34, 212, 106, 0.18); color: var(--g-deep); }
+      #stOk i { width: 14px; height: 14px; border-radius: 50%; background: var(--g); }
+      #stFire { background: var(--ink); color: var(--g); }
+      #stFire .icon { width: 30px; height: 30px; }
+      #ban .btns { position: absolute; left: 52px; right: 52px; bottom: 48px; display: flex; gap: 22px; }
+      #ban .btn { flex: 1; height: 96px; border-radius: 26px; display: grid; place-items: center; font-weight: 800; font-size: 34px; text-transform: uppercase; letter-spacing: 0.02em; }
+      #btnNo { border: 4px solid #d6d3cc; color: #7b807c; }
+      #btnBan { background: var(--ink); color: #fff; position: relative; overflow: hidden; }
+      #btnBan::after { content: ""; position: absolute; inset: 0; background: var(--g); transform: scaleY(var(--fill, 0)); transform-origin: 50% 100%; }
+      #btnBan span { position: relative; z-index: 1; }
+      #stamp {
+        position: absolute; left: 960px; top: 690px;
+        border: 12px solid var(--g); color: var(--g); background: rgba(11, 11, 11, 0.92); border-radius: 26px;
+        font-weight: 900; font-size: 150px; letter-spacing: 0.02em; padding: 6px 54px 14px; text-transform: uppercase;
+      }
+      .cursor { position: absolute; width: 60px; height: 60px; filter: drop-shadow(0 6px 10px rgba(0, 0, 0, 0.45)); }
+      #zr { left: 120px; top: 290px; white-space: nowrap; }
+      #zr .row { display: flex; align-items: center; gap: 18px; font-weight: 800; font-size: 46px; letter-spacing: -0.03em; text-transform: uppercase; position: relative; }
+      #zr .row + .row { margin-top: 16px; color: var(--g); }
+      #zr .row .icon { width: 48px; height: 48px; }
+      #zrStrike { position: absolute; left: 70px; right: 0; top: 50%; height: 8px; margin-top: -4px; border-radius: 4px; background: var(--g); transform-origin: 0 50%; }
+      #grenBox { left: 1790px; top: 300px; width: 150px; height: 180px; }
+      #barrBox { left: 1790px; top: 475px; width: 150px; height: 170px; }
+      .hudTag { font-size: 30px; }
+      .hudTag::after { content: ""; position: absolute; right: -16px; top: 50%; margin-top: -10px; border: 10px solid transparent; border-left: 12px solid var(--g); }
+      #glitch .sl { position: absolute; left: 0; width: 1920px; background: var(--g); mix-blend-mode: difference; }
+      #ops { left: 120px; top: 290px; }
+      #ops .o { background: var(--g); color: var(--ink); border-radius: 999px; padding: 4px 18px; }
+      #hp { left: 120px; top: 290px; width: 600px; }
+      #hp .t { font-weight: 800; font-size: 46px; letter-spacing: -0.03em; text-transform: uppercase; margin-top: 10px; }
+      #hp .hb { margin-top: 18px; height: 26px; border-radius: 13px; background: rgba(255, 255, 255, 0.14); overflow: hidden; position: relative; }
+      #hpFill { position: absolute; inset: 0; background: var(--g); transform-origin: 0 50%; }
+      #hpGhost { position: absolute; inset: 0; background: var(--paper); transform-origin: 0 50%; opacity: 0.7; }
+      .sai {
+        position: absolute; font-weight: 900; font-size: 112px; letter-spacing: -0.04em; text-transform: uppercase; white-space: nowrap;
+        color: #fff; -webkit-text-stroke: 12px var(--ink); paint-order: stroke fill; filter: drop-shadow(0 10px 0 rgba(0,0,0,.35));
+      }
+      .sai em { font-style: normal; color: var(--g); }
+      #nb { left: 120px; top: 290px; padding: 20px 38px 20px 22px; }
+      #nb .big { font-size: 46px; }
+      #nb .bi { width: 66px; height: 66px; border-radius: 50%; background: var(--paper); color: var(--ink); display: grid; place-items: center; position: relative; flex: none; }
+      #nb .bi .icon { width: 50px; height: 50px; }
+      #nb .bi::after { content: ""; position: absolute; left: 6px; right: 6px; top: 50%; height: 7px; margin-top: -3px; background: var(--g); border-radius: 4px; transform: rotate(-40deg) scaleX(var(--nx, 0)); }
+      #vig { background: radial-gradient(ellipse at center, rgba(0,0,0,0) 45%, rgba(0,0,0,.65) 100%); }
+      #outro { left: 960px; top: 300px; text-align: center; width: 860px; padding: 34px 40px 40px; }
+      #outro .t { font-weight: 800; font-size: 76px; letter-spacing: -0.035em; text-transform: uppercase; margin-top: 10px; }
+      #sub { display: inline-flex; align-items: center; gap: 14px; margin-top: 26px; padding: 18px 36px; border-radius: 999px; background: var(--g); color: var(--ink); font-weight: 800; font-size: 36px; text-transform: uppercase; position: relative; }
+      #sub .icon { width: 38px; height: 38px; stroke-width: 3; }
+      #subDone { position: absolute; inset: 0; border-radius: 999px; background: var(--paper); color: var(--ink); display: flex; align-items: center; justify-content: center; gap: 14px; }
+      #black { background: #000; }
+    </style>
+  </head>
+  <body>
+    <svg width="0" height="0" style="position:absolute">
+      <defs>
+        <symbol id="i-monkey" viewBox="0 0 48 48"><circle cx="24" cy="25" r="13"/><circle cx="9" cy="22" r="5"/><circle cx="39" cy="22" r="5"/><path d="M17 29c2 4 12 4 14 0"/><circle cx="19" cy="22" r="1.6" fill="currentColor"/><circle cx="29" cy="22" r="1.6" fill="currentColor"/><path d="M15 17c4-4 14-4 18 0"/></symbol>
+        <symbol id="i-zombie" viewBox="0 0 48 48"><path d="M14 42V24l3-8h3l1 8M21 24l2-12h3l1 12M27 24l3-10h3l1 12M34 26l3-6 3 1-2 11c-1 5-4 10-10 10H14"/></symbol>
+        <symbol id="i-banana" viewBox="0 0 48 48"><path d="M38 8c2 14-6 30-26 32-3 0-4-2-2-3 14-4 22-14 22-28"/><path d="M32 9l6-2"/></symbol>
+        <symbol id="i-waves" viewBox="0 0 48 48"><path d="M4 16c5-5 9-5 13 0s9 5 14 0 9-5 13 0"/><path d="M4 26c5-5 9-5 13 0s9 5 14 0 9-5 13 0"/><path d="M4 36c5-5 9-5 13 0s9 5 14 0 9-5 13 0"/></symbol>
+        <symbol id="i-alert" viewBox="0 0 48 48"><path d="M24 5l17 7v11c0 11-7 18-17 21C14 41 7 34 7 23V12z"/><path d="M24 16v10"/><circle cx="24" cy="32" r="1.8" fill="currentColor"/></symbol>
+        <symbol id="i-user" viewBox="0 0 48 48"><circle cx="24" cy="17" r="8"/><path d="M8 42c2-9 9-13 16-13s14 4 16 13"/></symbol>
+        <symbol id="i-flame" viewBox="0 0 48 48"><path d="M24 44c-9 0-15-6-15-14 0-9 8-13 9-22 6 4 9 9 8 15 2-1 4-4 4-7 5 5 9 9 9 15 0 8-6 13-15 13z"/><path d="M24 44c-4 0-6-3-6-6 0-4 4-6 5-10 3 3 7 6 7 10 0 3-2 6-6 6z"/></symbol>
+        <symbol id="i-clap" viewBox="0 0 48 48"><rect x="6" y="18" width="36" height="24" rx="4"/><path d="M6 18l33-9 2 8M14 16l5-8M24 13l5-8M33 11l4-7"/></symbol>
+        <symbol id="i-bell" viewBox="0 0 48 48"><path d="M12 34h24l-3-5V20c0-5-4-9-9-9s-9 4-9 9v9z"/><path d="M20 39c1 2 2 3 4 3s3-1 4-3"/></symbol>
+        <symbol id="i-check" viewBox="0 0 48 48"><path d="M10 25l9 9 19-20"/></symbol>
+        <symbol id="i-cursor" viewBox="0 0 48 48"><path d="M10 4l28 20-13 2 8 15-6 3-8-15-9 9z" fill="#fff" stroke="#0b0b0b" stroke-width="3" stroke-linejoin="round"/></symbol>
+      </defs>
+    </svg>
+
+    <div id="root" data-composition-id="main" data-start="0" data-duration="68.65" data-width="1920" data-height="1080">
+      <!-- base footage + camera -->
+      <div id="shake" class="layer">
+        <div id="cam" class="layer">
+          <video id="base" class="clip" src="assets/base.mp4" muted data-start="0" data-duration="68.65"></video>
+          <!-- overlays anchored to the footage (they zoom with the camera) -->
+          <div id="ring" class="ring hide" style="left:962px;top:380px;width:220px;height:220px"></div>
+          <div id="ringLbl" class="tag hide" style="left:962px;top:500px"><div class="stack"><span id="rl1">cara de mal</span><span id="rl2" class="hide">macacão</span></div></div>
+          <div id="gwMark" class="hide"></div>
+          <div id="gwLine" class="hide"></div>
+          <div id="me" class="hide">
+            <svg width="1" height="1" style="left:0;top:0"><path id="meArrow" d="M520 170 C 600 150, 690 180, 730 255" stroke="#22d46a" stroke-width="9" fill="none" stroke-linecap="round"/><path id="meHead" d="M705 236 L732 262 L740 226" stroke="#22d46a" stroke-width="9" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <div id="meTag" class="tag" style="left:380px;top:140px">Eu aqui, ó</div>
+          </div>
+          <div id="mk1" class="ring hide" style="left:972px;top:478px;width:130px;height:130px"></div>
+          <div id="mk2" class="ring hide" style="left:1231px;top:452px;width:130px;height:130px"></div>
+          <div id="mkc1" class="chip hide" style="left:925px;top:425px">1</div>
+          <div id="mkc2" class="chip hide" style="left:1184px;top:399px">2</div>
+          <div id="mkLbl" class="tag hide" style="left:990px;top:300px">macaquinhos</div>
+          <div id="banBox" class="hide" style="left:870px;top:380px;width:180px;height:240px">
+            <i class="brk tl"></i><i class="brk tr"></i><i class="brk bl"></i><i class="brk br"></i>
+            <div id="banTag" class="tag" style="left:50%;top:-14px"><div class="stack"><span id="bt1">alvo detectado</span><span id="bt2" class="hide">banana arremessada</span><span id="bt3" class="hide">na cara do noob</span></div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- cinematic bars (also hide the player UI baked into the cutscene recording) -->
+      <div id="barT" class="bar"></div>
+      <div id="barB" class="bar"></div>
+      <div id="flash" class="layer hide"></div>
+      <div id="glitch" class="layer hide">
+        <div class="sl" style="top:140px;height:38px"></div><div class="sl" style="top:410px;height:90px"></div>
+        <div class="sl" style="top:620px;height:24px"></div><div class="sl" style="top:860px;height:60px"></div>
+      </div>
+
+      <!-- screen-space motion elements -->
+      <div id="hook" class="pill hide"><i class="dot"></i>
+        <div class="stack big"><span id="h1"></span><span id="h2" class="hide">Matar o <span class="hl" id="hhl"><span>macaco</span></span>?</span></div>
+      </div>
+      <div id="gwCard" class="card hide"><div class="kicker">nome do jogo</div><div class="t">Gorilla Warfare</div><div class="s mono" id="gwSub"></div></div>
+      <div id="chap" class="card hide"><div class="kicker">capítulo 01</div>
+        <div class="stack"><div class="t" id="c1">A introdução</div><div class="t hide" id="c2"><svg class="icon" style="color:var(--g);width:60px;height:60px"><use href="#i-clap"/></svg>Cutscene de macaco</div></div>
+      </div>
+      <div id="qi" class="hide">Que isso?!</div>
+      <div id="rate" class="card hide"><div class="kicker">até agora</div><div class="t">Interessante</div>
+        <div class="meter"><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i><i><b></b></i></div></div>
+      <div id="waves" class="card hide"><div class="kicker">modo de jogo</div><div class="t"><svg class="icon"><use href="#i-waves"/></svg>Sobreviva às ondas</div></div>
+      <div id="toast" class="card hide"><div class="ic"><svg class="icon"><use href="#i-alert"/></svg></div>
+        <div style="flex:1"><div class="h"><b>IBAMA</b><span class="mono">agora</span></div><p>Nova denúncia: maus-tratos a macacos no Roblox</p></div></div>
+      <div id="zr" class="card hide"><div class="kicker">literalmente</div>
+        <div class="row" style="margin-top:12px"><svg class="icon"><use href="#i-zombie"/></svg><span>Zombie Rush</span><i id="zrStrike"></i></div>
+        <div class="row" id="zr2"><svg class="icon"><use href="#i-monkey"/></svg><span>…só que de macaco</span></div></div>
+      <div id="grenBox" class="box hide"></div>
+      <div id="grenTag" class="tag hudTag hide" style="left:1768px;top:390px">Granada</div>
+      <div id="barrBox" class="box hide"></div>
+      <div id="barrTag" class="tag hudTag hide" style="left:1768px;top:560px">Barricada</div>
+      <div id="ops" class="pill hide"><span class="big o">Ops!</span><span class="big">Fiz errado</span></div>
+      <div id="hp" class="card hide"><div class="kicker">cuidado</div><div class="t">Os macacos dão dano</div>
+        <div class="hb"><i id="hpGhost"></i><i id="hpFill"></i></div></div>
+      <div id="sai1" class="sai hide" style="left:170px;top:330px">Sai, <em>macaco!</em></div>
+      <div id="sai2" class="sai hide" style="left:960px;top:520px">Sai, <em>macaco!</em></div>
+      <div id="nb" class="pill hide"><div class="bi" id="nbi"><svg class="icon"><use href="#i-banana"/></svg></div>
+        <span class="big">Não vou te dar <span class="hl" id="nbhl"><span>banana</span></span></span></div>
+
+      <!-- full-frame motion b-roll -->
+      <div id="cut" class="layer hide">
+        <div class="grid"></div>
+        <div class="kick kicker" style="font-size:28px">denúncia recebida</div>
+        <div id="ban">
+          <div class="who"><div class="av"><svg class="icon"><use href="#i-user"/></svg></div>
+            <div><div class="nm">Jhon_Brick</div><div class="sub mono">jogador · Roblox</div></div></div>
+          <div class="st stack"><div id="stOk"><i></i>Ativo</div><div id="stFire" class="hide"><svg class="icon"><use href="#i-flame"/></svg>Churrascado</div></div>
+          <div class="btns"><div class="btn" id="btnNo">Ignorar</div><div class="btn" id="btnBan"><span>Banir</span></div></div>
+        </div>
+        <div id="stamp" class="hide">Banido</div>
+        <svg id="cur1" class="cursor" viewBox="0 0 48 48" style="left:1500px;top:900px"><use href="#i-cursor"/></svg>
+      </div>
+
+      <div id="vig" class="layer hide"></div>
+      <div id="outro" class="card hide"><div class="kicker">continua…</div><div class="t">Próxima onda</div>
+        <div id="sub"><svg class="icon"><use href="#i-bell"/></svg>Inscreva-se<div id="subDone" class="hide"><svg class="icon"><use href="#i-check"/></svg>Inscrito</div></div></div>
+      <svg id="cur2" class="cursor hide" viewBox="0 0 48 48" style="left:1300px;top:820px"><use href="#i-cursor"/></svg>
+      <div id="black" class="layer hide"></div>
+    </div>
+
+    <script>
+// Root timeline. All times come from data.js (generated by timeline.py from the EDL),
+// so every graphic stays locked to the words after a re-cut.
+(function () {
+  const { T, cam, shakes, total } = window.D;
+  const W = 1920, H = 1080;
+  const tl = gsap.timeline({ paused: true });
+  const q = (s) => document.querySelector(s);
+
+  // Deterministic PRNG (the renderer forbids Math.random).
+  function rng(seed) {
+    return function () {
+      seed |= 0; seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Centre offsets live in GSAP (xPercent/yPercent) so they survive late font loads.
+  gsap.set(".ring, .chip", { xPercent: -50, yPercent: -50 });
+  gsap.set("#ringLbl, #outro", { xPercent: -50 });
+  gsap.set("#banTag", { xPercent: -50, yPercent: -100 });
+  gsap.set(".hudTag", { xPercent: -100, yPercent: -50 });
+  gsap.set("#stamp", { xPercent: -50, yPercent: -50, rotation: -9 });
+  gsap.set(["#barT"], { yPercent: -101 });
+  gsap.set(["#barB"], { yPercent: 101 });
+
+  // ---------- helpers ----------
+  const NI = { immediateRender: false };
+  function show(sel, t, o = {}) {
+    tl.fromTo(sel,
+      { autoAlpha: 0, y: o.y ?? 26, scale: o.s ?? 0.96, filter: "blur(10px)" },
+      { autoAlpha: 1, y: 0, scale: 1, filter: "blur(0px)", duration: o.d ?? 0.5, ease: o.ease ?? "expo.out", ...NI }, t);
+  }
+  function hide(sel, t, o = {}) {
+    tl.fromTo(sel,
+      { autoAlpha: 1, y: 0, scale: 1, filter: "blur(0px)" },
+      { autoAlpha: 0, y: o.y ?? -18, scale: o.s ?? 0.98, filter: "blur(8px)", duration: o.d ?? 0.3, ease: "power2.in", ...NI }, t);
+  }
+  function cut(sel, t) { tl.set(sel, { autoAlpha: 0 }, t); }
+  // Pill reveal: the shape draws itself left-to-right, then the content settles.
+  function pillIn(sel, t) {
+    tl.fromTo(sel, { autoAlpha: 1, clipPath: "inset(0% 100% 0% 0% round 80px)" },
+      { autoAlpha: 1, clipPath: "inset(-40% -6% -60% -6% round 80px)", duration: 0.6, ease: "expo.out", ...NI }, t);
+    tl.fromTo(sel + " > *", { x: -30, filter: "blur(6px)" }, { x: 0, filter: "blur(0px)", duration: 0.5, ease: "expo.out", stagger: 0.05, ...NI }, t + 0.05);
+  }
+  function swap(a, b, t) {
+    tl.fromTo(a, { autoAlpha: 1, y: 0, filter: "blur(0px)" }, { autoAlpha: 0, y: -20, filter: "blur(6px)", duration: 0.2, ease: "power2.in", ...NI }, t);
+    tl.fromTo(b, { autoAlpha: 0, y: 20, filter: "blur(6px)" }, { autoAlpha: 1, y: 0, filter: "blur(0px)", duration: 0.38, ease: "expo.out", ...NI }, t + 0.06);
+  }
+  function type(el, text, t0, dur) {
+    el.innerHTML = "";
+    const chars = [...text];
+    chars.forEach((c, i) => {
+      const s = document.createElement("span");
+      s.textContent = c; s.style.opacity = 0;
+      el.appendChild(s);
+      tl.set(s, { opacity: 1 }, t0 + (i * dur) / chars.length);
+    });
+  }
+  function popRing(sel, t, d = 0.45) {
+    tl.fromTo(sel, { autoAlpha: 0, scale: 1.8 }, { autoAlpha: 1, scale: 1, duration: d, ease: "back.out(1.15)", ...NI }, t);
+  }
+
+  // ---------- camera ----------
+  function camXY(s, fx, fy) {
+    let x = W / 2 - fx * s, y = H / 2 - fy * s;
+    x = Math.min(0, Math.max(W - W * s, x));
+    y = Math.min(0, Math.max(H - H * s, y));
+    return { x, y };
+  }
+  let C = { scale: 1, x: 0, y: 0 };
+  tl.set("#cam", { scale: 1, x: 0, y: 0 }, 0);
+  for (const [t, s, fx, fy, dur, ease] of cam) {
+    const p = camXY(s, fx, fy);
+    const to = { scale: s, x: p.x, y: p.y };
+    if (dur <= 0) tl.set("#cam", to, t);
+    else tl.fromTo("#cam", { ...C }, { ...to, duration: dur, ease, ...NI }, t);
+    C = to;
+  }
+
+  // ---------- shakes ----------
+  tl.set("#shake", { x: 0, y: 0, rotation: 0, scale: 1 }, 0);
+  for (const [t, amp, dur, seed] of shakes) {
+    const r = rng(seed), n = Math.round(dur * 30);
+    for (let i = 0; i < n; i++) {
+      const k = Math.pow(1 - i / n, 1.6);
+      tl.set("#shake", { x: (r() * 2 - 1) * amp * k, y: (r() * 2 - 1) * amp * k, rotation: (r() * 2 - 1) * 0.35 * k, scale: 1.035 }, t + i / 30);
+    }
+    tl.set("#shake", { x: 0, y: 0, rotation: 0, scale: 1 }, t + dur);
+  }
+  function flash(t, a = 0.85, d = 0.35) {
+    tl.fromTo("#flash", { autoAlpha: a }, { autoAlpha: 0, duration: d, ease: "power2.out", ...NI }, t);
+  }
+
+  // ---------- 1. hook ----------
+  type(q("#h1"), "Você tem que...", T.hook_in + 0.2, 1.3);
+  pillIn("#hook", T.hook_in);
+  swap("#h1", "#h2", T.hook_swap);
+  tl.fromTo("#hhl", { "--hx": 0 }, { "--hx": 1, duration: 0.45, ease: "expo.out", ...NI }, T.hook_swap + 0.2);
+  hide("#hook", T.hook_out);
+
+  // ---------- 2. cara de mal -> macacão (one ring that travels) ----------
+  popRing("#ring", T.mal);
+  show("#ringLbl", T.mal + 0.1, { y: 14 });
+  tl.fromTo("#ring", { x: 0, y: 0, scale: 1 },
+    { x: 453, y: 25, scale: 1.14, duration: 0.5, ease: "power3.inOut", ...NI }, T.macacao - 0.3);
+  tl.fromTo("#ringLbl", { x: 0, y: 0 }, { x: 453, y: 40, duration: 0.5, ease: "power3.inOut", ...NI }, T.macacao - 0.3);
+  swap("#rl1", "#rl2", T.macacao);
+  cut(["#ring", "#ringLbl"], T.ring_out + 0.12);
+
+  // ---------- 3. gorilla warfare ----------
+  tl.fromTo("#gwMark", { autoAlpha: 0, scale: 1.25 }, { autoAlpha: 1, scale: 1, duration: 0.35, ease: "expo.out", ...NI }, T.gw_mark);
+  tl.fromTo("#gwLine", { autoAlpha: 1, scaleX: 0 }, { scaleX: 1, duration: 0.45, ease: "expo.out", ...NI }, T.gw_mark + 0.1);
+  show("#gwCard", T.gw_card);
+  type(q("#gwSub"), "como se pronuncia isso?", T.gw_sub, 0.55);
+  hide("#gwCard", T.gw_out);
+  cut(["#gwMark", "#gwLine"], T.gw_out + 0.15);
+
+  // ---------- 4. cutscene: bars + chapter card ----------
+  tl.fromTo("#barT", { yPercent: -101 }, { yPercent: 0, duration: 0.55, ease: "expo.out", ...NI }, T.bars_in);
+  tl.fromTo("#barB", { yPercent: 101 }, { yPercent: 0, duration: 0.55, ease: "expo.out", ...NI }, T.bars_in);
+  show("#chap", T.chap_in, { y: 30 });
+  swap("#c1", "#c2", T.chap_swap);
+  hide("#chap", T.chap_out);
+
+  // ---------- 5. "ó eu aqui" ----------
+  const arrow = q("#meArrow"), head = q("#meHead");
+  const L = arrow.getTotalLength();
+  gsap.set(arrow, { strokeDasharray: L, strokeDashoffset: L });
+  gsap.set(head, { strokeDasharray: 80, strokeDashoffset: 80 });
+  tl.set("#me", { autoAlpha: 1 }, T.me_in);
+  tl.fromTo(arrow, { strokeDashoffset: L }, { strokeDashoffset: 0, duration: 0.35, ease: "power2.out", ...NI }, T.me_in);
+  tl.fromTo(head, { strokeDashoffset: 80 }, { strokeDashoffset: 0, duration: 0.18, ease: "power2.out", ...NI }, T.me_in + 0.3);
+  show("#meTag", T.me_in + 0.12, { y: 14 });
+  cut("#me", T.me_out + 0.08);
+
+  // ---------- 6. macaquinhos ----------
+  popRing("#mk1", T.mk_in); popRing("#mk2", T.mk_in + 0.22);
+  show("#mkc1", T.mk_in + 0.12, { s: 0.5, y: 0 }); show("#mkc2", T.mk_in + 0.34, { s: 0.5, y: 0 });
+  show("#mkLbl", T.mk_in + 0.45, { y: 14 });
+  cut(["#mk1", "#mk2", "#mkc1", "#mkc2", "#mkLbl"], T.mk_out + 0.1);
+
+  // ---------- 7. banana tracker (follows the banana, then jumps to the noob) ----------
+  tl.fromTo("#banBox", { autoAlpha: 0, scale: 1.5 }, { autoAlpha: 1, scale: 1, duration: 0.35, ease: "expo.out", ...NI }, T.ban_in);
+  const path = [[0.0, 960, 480], [0.4, 1008, 480], [0.8, 912, 480], [1.2, 960, 528], [1.6, 912, 528], [1.9, 940, 500]];
+  let prev = path[0];
+  for (const p of path.slice(1)) {
+    tl.fromTo("#banBox", { x: prev[1] - 960, y: prev[2] - 500 },
+      { x: p[1] - 960, y: p[2] - 500, duration: p[0] - prev[0], ease: "sine.inOut", ...NI }, T.ban_in - 0.03 + prev[0]);
+    prev = p;
+  }
+  swap("#bt1", "#bt2", T.ban_tag);
+  tl.fromTo("#banBox", { x: -20, y: 0, scale: 1 },
+    { x: 380, y: -20, scale: 1.35, duration: 0.3, ease: "expo.out", ...NI }, T.ban_hit);
+  swap("#bt2", "#bt3", T.ban_hit + 0.05);
+  cut("#banBox", T.ban_out + 0.1);
+
+  // ---------- 8. "que isso?!" + explosion ----------
+  tl.fromTo("#qi", { autoAlpha: 0, scale: 1.6, rotation: -6, filter: "blur(12px)" },
+    { autoAlpha: 1, scale: 1, rotation: -3, filter: "blur(0px)", duration: 0.32, ease: "back.out(1.3)", ...NI }, T.qi_in);
+  tl.fromTo("#qi", { scale: 1 }, { scale: 1.12, duration: 0.12, ease: "power2.out", yoyo: true, repeat: 1, ...NI }, T.boom);
+  flash(T.boom, 0.9, 0.45);
+  hide("#qi", T.qi_out, { s: 0.9 });
+
+  // ---------- 9. "até agora achei interessante" ----------
+  show("#rate", T.rate_in);
+  tl.fromTo("#rate .meter b", { scaleX: 0 }, { scaleX: (i) => (i < 4 ? 1 : 0.35), duration: 0.22, stagger: 0.09, ease: "power2.out", ...NI }, T.rate_fill);
+  hide("#rate", T.rate_out);
+  flash(T.crash, 0.7, 0.3);
+
+  // ---------- bars out (gameplay starts) ----------
+  tl.fromTo("#barT", { yPercent: 0 }, { yPercent: -101, duration: 0.45, ease: "power3.in", ...NI }, T.bars_out - 0.2);
+  tl.fromTo("#barB", { yPercent: 0 }, { yPercent: 101, duration: 0.45, ease: "power3.in", ...NI }, T.bars_out - 0.2);
+
+  // ---------- 10. sobreviva às ondas ----------
+  show("#waves", T.waves_in, { y: 30 });
+  hide("#waves", T.waves_out);
+
+  // ---------- 11. Ibama: toast, then full-frame b-roll ----------
+  tl.fromTo("#toast", { autoAlpha: 0, x: -80, filter: "blur(8px)" }, { autoAlpha: 1, x: 0, filter: "blur(0px)", duration: 0.5, ease: "expo.out", ...NI }, T.toast_in);
+  hide("#toast", T.toast_out);
+  tl.fromTo("#cut", { autoAlpha: 1, clipPath: "circle(0% at 50% 50%)" }, { autoAlpha: 1, clipPath: "circle(75% at 50% 50%)", duration: 0.45, ease: "power3.inOut", ...NI }, T.cut_in);
+  tl.fromTo("#ban", { y: 80, scale: 0.92, autoAlpha: 0 }, { y: 0, scale: 1, autoAlpha: 1, duration: 0.55, ease: "expo.out", ...NI }, T.cut_in + 0.15);
+  tl.fromTo("#cut .kick", { autoAlpha: 0, y: 12 }, { autoAlpha: 1, y: 0, duration: 0.4, ease: "expo.out", ...NI }, T.cut_in + 0.25);
+  // cursor travels to "Banir" and clicks on the word
+  tl.fromTo("#cur1", { x: 0, y: 30 }, { x: -348, y: -241, duration: 0.7, ease: "power3.inOut", ...NI }, T.cut_click - 0.75);
+  tl.fromTo("#cur1", { scale: 1 }, { scale: 0.82, duration: 0.07, yoyo: true, repeat: 1, ease: "power1.inOut", ...NI }, T.cut_click);
+  tl.fromTo("#btnBan", { "--fill": 0 }, { "--fill": 1, duration: 0.25, ease: "expo.out", ...NI }, T.cut_click);
+  tl.fromTo("#stamp", { autoAlpha: 0, scale: 2.6 }, { autoAlpha: 1, scale: 1, duration: 0.18, ease: "power4.in", ...NI }, T.cut_stamp - 0.13);
+  tl.fromTo("#ban", { x: 0 }, { x: 14, duration: 0.04, yoyo: true, repeat: 5, ease: "none", ...NI }, T.cut_stamp + 0.05);
+  tl.fromTo("#stamp", { y: 0 }, { y: -6, duration: 0.05, yoyo: true, repeat: 3, ease: "none", ...NI }, T.cut_stamp + 0.05);
+  swap("#stOk", "#stFire", T.cut_fire);
+  tl.fromTo("#ban", { rotation: 0 }, { rotation: -2, duration: 0.3, ease: "power2.out", ...NI }, T.cut_fire);
+  cut("#cut", T.cut_out);
+
+  // ---------- 12. Zombie Rush, só que de macaco ----------
+  show("#zr", T.zr_in);
+  gsap.set("#zr2", { autoAlpha: 0 });
+  tl.fromTo("#zrStrike", { scaleX: 0 }, { scaleX: 1, duration: 0.3, ease: "expo.out", ...NI }, T.zr_strike);
+  tl.fromTo("#zr2", { autoAlpha: 0, y: 18, filter: "blur(6px)" }, { autoAlpha: 1, y: 0, filter: "blur(0px)", duration: 0.4, ease: "expo.out", ...NI }, T.zr_strike + 0.12);
+  hide("#zr", T.zr_out);
+
+  // ---------- 13. granada / barricada (HUD callouts) ----------
+  tl.fromTo("#grenBox", { autoAlpha: 0, scale: 1.3 }, { autoAlpha: 1, scale: 1, duration: 0.35, ease: "expo.out", ...NI }, T.gren_in);
+  show("#grenTag", T.gren_in + 0.08, { y: 0, s: 0.9 });
+  cut(["#grenBox", "#grenTag"], T.gren_out + 0.1);
+  tl.fromTo("#barrBox", { autoAlpha: 0, scale: 1.3 }, { autoAlpha: 1, scale: 1, duration: 0.35, ease: "expo.out", ...NI }, T.barr_in);
+  show("#barrTag", T.barr_in + 0.08, { y: 0, s: 0.9 });
+  cut(["#barrBox", "#barrTag"], T.barr_out + 0.1);
+
+  // ---------- 14. glitch over the accidental desktop frames, then "ops" ----------
+  const gr = rng(99);
+  for (let i = 0; i < 11; i++) {
+    const t = T.glitch + i / 30;
+    tl.set("#glitch", { autoAlpha: i % 3 === 2 ? 0 : 1, y: (gr() - 0.5) * 120 }, t);
+    tl.set("#cam", { filter: i % 2 ? "hue-rotate(80deg) saturate(2.2) contrast(1.3)" : "invert(0.85) hue-rotate(160deg)" }, t);
+  }
+  tl.set("#glitch", { autoAlpha: 0, y: 0 }, T.glitch + 11 / 30);
+  tl.set("#cam", { filter: "none" }, T.glitch + 11 / 30);
+  pillIn("#ops", T.ops_in);
+  hide("#ops", T.ops_out);
+
+  // ---------- 15. dano, sai macaco, sem banana ----------
+  show("#hp", T.hp_in);
+  gsap.set(["#hpFill", "#hpGhost"], { scaleX: 1 });
+  [0.75, 0.5, 0.3].forEach((v, i) => {
+    const t = T.hp_hit + i * 0.1;
+    tl.set("#hpFill", { scaleX: v }, t);
+    tl.fromTo("#hpGhost", { scaleX: i === 0 ? 1 : [0.75, 0.5][i - 1] }, { scaleX: v, duration: 0.25, ease: "power2.in", ...NI }, t + 0.05);
+  });
+  hide("#hp", T.hp_out);
+  for (const [sel, t, rot] of [["#sai1", T.sai1, -5], ["#sai2", T.sai2, 4]]) {
+    tl.fromTo(sel, { autoAlpha: 0, scale: 1.7, rotation: rot * 2, filter: "blur(10px)" },
+      { autoAlpha: 1, scale: 1, rotation: rot, filter: "blur(0px)", duration: 0.25, ease: "back.out(1.4)", ...NI }, t);
+  }
+  hide(["#sai1", "#sai2"], T.sai_out, { s: 0.9 });
+  pillIn("#nb", T.nb_in);
+  tl.fromTo("#nbhl", { "--hx": 0 }, { "--hx": 1, duration: 0.4, ease: "expo.out", ...NI }, T.nb_word);
+  tl.fromTo("#nbi", { "--nx": 0 }, { "--nx": 1, duration: 0.3, ease: "expo.out", ...NI }, T.nb_word + 0.1);
+  hide("#nb", T.nb_out);
+
+  // ---------- 16. outro ----------
+  tl.fromTo("#vig", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.8, ease: "power2.out", ...NI }, T.outro_in);
+  show("#outro", T.outro_in + 0.1, { y: 40 });
+  tl.fromTo("#cur2", { autoAlpha: 0, x: 200, y: 80 }, { autoAlpha: 1, x: -260, y: -230, duration: 0.65, ease: "power3.inOut", ...NI }, T.outro_click - 0.7);
+  tl.fromTo("#cur2", { scale: 1 }, { scale: 0.82, duration: 0.07, yoyo: true, repeat: 1, ease: "power1.inOut", ...NI }, T.outro_click);
+  tl.fromTo("#subDone", { autoAlpha: 0, scale: 0.6 }, { autoAlpha: 1, scale: 1, duration: 0.3, ease: "back.out(1.3)", ...NI }, T.outro_click + 0.05);
+  tl.fromTo("#black", { autoAlpha: 0 }, { autoAlpha: 1, duration: total - T.fade, ease: "power1.in", ...NI }, T.fade);
+
+  tl.set({}, {}, total);
+  window.__timelines = window.__timelines || {};
+  window.__timelines["main"] = tl;
+})();
+    </script>
+  </body>
+</html>

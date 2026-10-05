@@ -1,0 +1,6 @@
+node_modules/
+work/
+out/
+hf/assets/base.mp4
+hf/renders/
+__pycache__/
