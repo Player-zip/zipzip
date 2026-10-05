@@ -1,0 +1,11 @@
+{
+  "name": "peixao-hunter-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": "20.x"
+  },
+  "dependencies": {
+    "gmgn-cli": "^1.6.6"
+  }
+}
