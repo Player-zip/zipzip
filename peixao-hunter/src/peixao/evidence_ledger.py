@@ -9,6 +9,16 @@ import time
 
 import pandas as pd
 
+from .units import RATIO, ROI_UNIT_KEY, ratio_from_any, strict_ratio
+
+
+# Métricas "30d" mais velhas que isto só são usadas se não houver nada recente.
+DEFAULT_EVIDENCE_MAX_AGE_DAYS = 30
+# Observações antigas (exceto a última de cada provedor/métrica) são apagadas.
+DEFAULT_EVIDENCE_RETENTION_DAYS = 120
+# Provedores cujos caches são sincronizados com data e atribuição corretas.
+CACHE_SYNCED_PROVIDERS = {"NANSEN", "ZERION", "COINSTATS"}
+EVM_CHAINS = {"base", "robinhood", "ethereum", "evm"}
 
 _PROVIDER_PRIORITY = {
     "NANSEN": 100,
@@ -42,9 +52,38 @@ def normalize_chain(chain: str | None) -> str:
 
 def normalize_address(chain: str, address: str | None) -> str:
     value = str(address or "").strip()
-    if normalize_chain(chain) in {"base", "robinhood", "ethereum", "evm"}:
+    if normalize_chain(chain) in EVM_CHAINS:
         return value.lower()
     return value
+
+
+_SOURCE_CHAINS = {
+    "legacy_v6": "robinhood",
+    "radar_robinhood": "robinhood",
+    "radar_base": "base",
+    "radar_solana": "solana",
+}
+
+
+def infer_chain(row, default: str | None = None) -> str:
+    """Rede de uma linha do pipeline, com a mesma regra em todo lugar.
+
+    Usa a coluna ``chain``; sem ela, a origem da linha; sem origem, o formato do
+    endereço (``0x`` = EVM sem rede conhecida, o resto = Solana).
+    """
+    raw = row.get("chain") if hasattr(row, "get") else None
+    text = "" if raw is None else str(raw).strip().lower()
+    if text and text not in {"nan", "none", "null", "unknown"}:
+        return normalize_chain(text)
+    source = str(row.get("selective_input_source", "") or "").strip().lower() if hasattr(row, "get") else ""
+    if source in _SOURCE_CHAINS:
+        return _SOURCE_CHAINS[source]
+    if default:
+        return normalize_chain(default)
+    address = str(row.get("address", "") or "").strip() if hasattr(row, "get") else ""
+    if address.lower().startswith("0x") and len(address) == 42:
+        return "evm"
+    return "solana"
 
 
 def wallet_key(chain: str, address: str) -> str:
@@ -77,6 +116,8 @@ def _connect(db_path: Path) -> sqlite3.Connection:
         );
         CREATE INDEX IF NOT EXISTS idx_wallet_evidence_lookup
             ON wallet_evidence(wallet_key, metric, observed_epoch DESC);
+        CREATE INDEX IF NOT EXISTS idx_wallet_evidence_latest
+            ON wallet_evidence(wallet_key, provider, metric, observed_epoch DESC);
 
         CREATE TABLE IF NOT EXISTS provider_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,7 +171,18 @@ def normalize_metrics(provider: str, metrics: dict) -> tuple[dict, list[str]]:
     raw_wr = metrics.get("win_rate")
     if raw_wr is None:
         raw_wr = metrics.get("gmgn_winrate_30d")
-    wr, issue = _ratio(raw_wr, strict=(provider == "NANSEN"))
+    if provider == "NANSEN":
+        wr = strict_ratio(raw_wr)
+        issue = "invalid_ratio_unit" if wr is None and _float(raw_wr) is not None else None
+    else:
+        wr = ratio_from_any(raw_wr)
+        number = _float(raw_wr)
+        if wr is None and number is not None:
+            issue = "invalid_ratio_unit"
+        elif wr is not None and number is not None and number > 1.0:
+            issue = "converted_percent_points_to_ratio"
+        else:
+            issue = None
     if wr is not None:
         out["win_rate"] = wr
         out["gmgn_winrate_30d"] = wr
@@ -138,8 +190,15 @@ def normalize_metrics(provider: str, metrics: dict) -> tuple[dict, list[str]]:
         issues.append(f"win_rate:{issue}")
 
     roi = _float(metrics.get("realized_roi_30d"))
+    roi_unit = str(metrics.get(ROI_UNIT_KEY) or "").strip().lower()
     if roi is not None:
-        if provider == "NANSEN":
+        if roi_unit == RATIO:
+            # Adaptador já converteu e marcou a unidade: confiar.
+            out["realized_roi_30d"] = roi
+        elif roi_unit == "percent":
+            out["realized_roi_30d"] = roi / 100.0
+        elif provider == "NANSEN":
+            # Cache antigo do Nansen: realized_pnl_percent bruto.
             out["realized_roi_30d"] = roi / 100.0
             issues.append("realized_roi_30d:nansen_percent_points_to_ratio")
         elif provider == "ZERION":
@@ -147,6 +206,9 @@ def normalize_metrics(provider: str, metrics: dict) -> tuple[dict, list[str]]:
                 out["realized_roi_30d"] = roi
             else:
                 issues.append("realized_roi_30d:zerion_unit_ambiguous_ignored")
+        elif provider in {"GMGN_CACHE", "BIRDEYE"}:
+            # GMGN (V6 validado) e Birdeye já entregam razão.
+            out["realized_roi_30d"] = roi
         elif abs(roi) <= 1.0:
             out["realized_roi_30d"] = roi
         elif abs(roi) <= 10000.0:
@@ -189,6 +251,13 @@ def _unit(metric: str) -> str:
     return "count"
 
 
+def _same_value(a, b) -> bool:
+    try:
+        return abs(float(a) - float(b)) <= 1e-12 * max(1.0, abs(float(a)), abs(float(b)))
+    except (TypeError, ValueError):
+        return False
+
+
 def record_metrics(
     db_path: Path,
     *,
@@ -200,11 +269,17 @@ def record_metrics(
     window_days: int | None = 30,
     methodology: str | None = None,
     source_quality: float = 1.0,
+    conn: sqlite3.Connection | None = None,
 ) -> dict:
+    """Grava observações; valor repetido só atualiza a data da última linha.
+
+    Assim o histórico cresce apenas quando o valor muda, e a data continua
+    refletindo a confirmação mais recente.
+    """
     chain = normalize_chain(chain)
     address = normalize_address(chain, address)
     if not address:
-        return {"recorded": 0, "issues": ["missing_address"]}
+        return {"recorded": 0, "inserted": 0, "refreshed": 0, "issues": ["missing_address"]}
     normalized, issues = normalize_metrics(provider, metrics)
     when = str(observed_at or _now_iso())
     try:
@@ -213,9 +288,41 @@ def record_metrics(
         when = _now_iso()
         epoch = int(time.time())
     issue_text = ";".join(issues)
-    conn = _connect(db_path)
+    key = wallet_key(chain, address)
+    provider = str(provider).upper()
+    methodology = methodology or ""
+    own_conn = conn is None
+    if own_conn:
+        conn = _connect(db_path)
+    inserted = refreshed = 0
     try:
         for metric, value in normalized.items():
+            latest = conn.execute(
+                """
+                SELECT rowid, value, observed_epoch, methodology, window_days
+                FROM wallet_evidence
+                WHERE wallet_key=? AND provider=? AND metric=?
+                ORDER BY observed_epoch DESC LIMIT 1
+                """,
+                (key, provider, metric),
+            ).fetchone()
+            if (
+                latest is not None
+                and _same_value(latest[1], value)
+                and str(latest[3] or "") == methodology
+                and latest[4] == window_days
+            ):
+                if epoch > int(latest[2] or 0):
+                    conn.execute(
+                        """
+                        UPDATE OR REPLACE wallet_evidence
+                        SET observed_at=?, observed_epoch=?, source_quality=?, normalization_issue=?
+                        WHERE rowid=?
+                        """,
+                        (when, epoch, float(source_quality), issue_text, latest[0]),
+                    )
+                    refreshed += 1
+                continue
             conn.execute(
                 """
                 INSERT OR REPLACE INTO wallet_evidence
@@ -225,15 +332,18 @@ def record_metrics(
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    wallet_key(chain, address), chain, address, str(provider).upper(), metric,
+                    key, chain, address, provider, metric,
                     float(value), _unit(metric), when, epoch, window_days,
-                    methodology or "", float(source_quality), issue_text,
+                    methodology, float(source_quality), issue_text,
                 ),
             )
-        conn.commit()
+            inserted += 1
+        if own_conn:
+            conn.commit()
     finally:
-        conn.close()
-    return {"recorded": len(normalized), "issues": issues}
+        if own_conn:
+            conn.close()
+    return {"recorded": inserted + refreshed, "inserted": inserted, "refreshed": refreshed, "issues": issues}
 
 
 def _load_json(path: Path) -> dict:
@@ -252,45 +362,66 @@ def sync_provider_caches(state_dir: Path, db_path: Path) -> dict:
     )
     observations = entries_seen = files = 0
     issue_counts: dict[str, int] = {}
-    for provider, pattern, method, quality in patterns:
-        for path in state_dir.glob(pattern):
-            files += 1
-            name = path.name
-            if provider == "NANSEN":
-                chain = name[len("nansen_pnl_"):-len("_cache.json")]
-            elif provider == "ZERION":
-                chain = name[len("zerion_pnl_"):-len("_cache.json")]
-            else:
-                chain = name[len("coinstats_30d_"):-len("_cache.json")]
-            payload = _load_json(path)
-            entries = payload.get("entries") if isinstance(payload.get("entries"), dict) else {}
-            for address, item in entries.items():
-                if not isinstance(item, dict) or not isinstance(item.get("metrics"), dict):
-                    continue
-                entries_seen += 1
-                result = record_metrics(
-                    db_path,
-                    chain=chain,
-                    address=str(address),
-                    provider=provider,
-                    metrics=item["metrics"],
-                    observed_at=str(item.get("checked_at") or _now_iso()),
-                    window_days=30,
-                    methodology=method,
-                    source_quality=quality,
-                )
-                observations += int(result.get("recorded", 0))
-                for issue in result.get("issues", []):
-                    issue_counts[issue] = issue_counts.get(issue, 0) + 1
+    conn = _connect(db_path)
+    try:
+        for provider, pattern, method, quality in patterns:
+            for path in state_dir.glob(pattern):
+                files += 1
+                name = path.name
+                if provider == "NANSEN":
+                    chain = name[len("nansen_pnl_"):-len("_cache.json")]
+                elif provider == "ZERION":
+                    chain = name[len("zerion_pnl_"):-len("_cache.json")]
+                else:
+                    chain = name[len("coinstats_30d_"):-len("_cache.json")]
+                payload = _load_json(path)
+                entries = payload.get("entries") if isinstance(payload.get("entries"), dict) else {}
+                for address, item in entries.items():
+                    if not isinstance(item, dict) or not isinstance(item.get("metrics"), dict):
+                        continue
+                    entries_seen += 1
+                    result = record_metrics(
+                        db_path,
+                        chain=chain,
+                        address=str(address),
+                        provider=provider,
+                        metrics=item["metrics"],
+                        observed_at=str(item.get("checked_at") or _now_iso()),
+                        window_days=30,
+                        methodology=method,
+                        source_quality=quality,
+                        conn=conn,
+                    )
+                    observations += int(result.get("inserted", 0))
+                    for issue in result.get("issues", []):
+                        issue_counts[issue] = issue_counts.get(issue, 0) + 1
+        conn.commit()
+    finally:
+        conn.close()
     return {
         "status": "DONE", "cache_files": files, "wallet_entries": entries_seen,
         "observations": observations, "normalization_issues": issue_counts,
     }
 
 
-def canonical_metrics_for_wallet(db_path: Path, chain: str, address: str) -> dict:
+def canonical_metrics_for_wallet(
+    db_path: Path,
+    chain: str,
+    address: str,
+    *,
+    conn: sqlite3.Connection | None = None,
+    max_age_days: float | None = DEFAULT_EVIDENCE_MAX_AGE_DAYS,
+    now_epoch: int | None = None,
+) -> dict:
+    """Escolhe o valor canônico de cada métrica.
+
+    Dentro da janela de frescor vale a prioridade do provedor; uma observação
+    velha só é usada quando não existe nenhuma recente para aquela métrica.
+    """
     key = wallet_key(chain, address)
-    conn = _connect(db_path)
+    own_conn = conn is None
+    if own_conn:
+        conn = _connect(db_path)
     try:
         rows = conn.execute(
             """
@@ -301,7 +432,8 @@ def canonical_metrics_for_wallet(db_path: Path, chain: str, address: str) -> dic
             (key,),
         ).fetchall()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
     latest: dict[tuple[str, str], tuple] = {}
     for row in rows:
@@ -310,26 +442,36 @@ def canonical_metrics_for_wallet(db_path: Path, chain: str, address: str) -> dic
     for row in latest.values():
         by_metric.setdefault(str(row[1]), []).append(row)
 
+    now = int(time.time()) if now_epoch is None else int(now_epoch)
+    max_age = None if max_age_days is None or max_age_days <= 0 else float(max_age_days) * 86400.0
     out: dict = {"wallet_key": key}
-    sources: set[str] = {str(row[0]).upper() for row in latest.values()}
+    sources: set[str] = set()
     all_issues: set[str] = set()
+    stale_metrics = 0
+    pools: dict[str, list[tuple]] = {}
     for metric, observations in by_metric.items():
-        observations.sort(
+        fresh = [r for r in observations if max_age is None or now - int(r[3] or 0) <= max_age]
+        pool = fresh or observations
+        if not fresh:
+            stale_metrics += 1
+        pool.sort(
             key=lambda row: (
                 _PROVIDER_PRIORITY.get(str(row[0]).upper(), 0),
                 float(row[4] or 0.0), int(row[3] or 0),
             ),
             reverse=True,
         )
-        chosen = observations[0]
+        pools[metric] = pool
+        chosen = pool[0]
         out[metric] = float(chosen[2])
-        for row in observations:
+        for row in pool:
+            sources.add(str(row[0]).upper())
             issue = str(row[5] or "")
             if issue:
                 all_issues.update(x for x in issue.split(";") if x)
 
-    wr_values = [float(row[2]) for row in by_metric.get("win_rate", [])]
-    roi_values = [float(row[2]) for row in by_metric.get("realized_roi_30d", [])]
+    wr_values = [float(row[2]) for row in pools.get("win_rate", [])]
+    roi_values = [float(row[2]) for row in pools.get("realized_roi_30d", [])]
     wr_spread = max(wr_values) - min(wr_values) if len(wr_values) >= 2 else 0.0
     roi_spread = max(roi_values) - min(roi_values) if len(roi_values) >= 2 else 0.0
     confidence = 1.0
@@ -343,9 +485,51 @@ def canonical_metrics_for_wallet(db_path: Path, chain: str, address: str) -> dic
         "evidence_confidence": round(confidence, 4),
         "evidence_disagreement_wr": round(wr_spread, 4),
         "evidence_disagreement_roi": round(roi_spread, 4),
+        "evidence_stale_metrics": int(stale_metrics),
         "metric_normalization_issues": ";".join(sorted(all_issues)),
     })
     return out
+
+
+def prune_evidence(
+    db_path: Path,
+    *,
+    retention_days: float = DEFAULT_EVIDENCE_RETENTION_DAYS,
+    conn: sqlite3.Connection | None = None,
+    now_epoch: int | None = None,
+) -> dict:
+    """Apaga histórico antigo, preservando a última observação de cada métrica."""
+    if retention_days is None or retention_days <= 0:
+        return {"status": "DISABLED", "deleted": 0}
+    now = int(time.time()) if now_epoch is None else int(now_epoch)
+    cutoff = now - int(float(retention_days) * 86400)
+    own_conn = conn is None
+    if own_conn:
+        conn = _connect(db_path)
+    try:
+        deleted = conn.execute(
+            """
+            DELETE FROM wallet_evidence WHERE rowid IN (
+                SELECT rowid FROM (
+                    SELECT rowid, observed_epoch,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY wallet_key, provider, metric
+                               ORDER BY observed_epoch DESC
+                           ) AS rn
+                    FROM wallet_evidence
+                ) WHERE rn > 1 AND observed_epoch < ?
+            )
+            """,
+            (cutoff,),
+        ).rowcount
+        runs_deleted = conn.execute(
+            "DELETE FROM provider_runs WHERE recorded_epoch < ?", (cutoff,)
+        ).rowcount
+        conn.commit()
+    finally:
+        if own_conn:
+            conn.close()
+    return {"status": "DONE", "deleted": int(deleted or 0), "provider_runs_deleted": int(runs_deleted or 0)}
 
 
 def record_provider_run(

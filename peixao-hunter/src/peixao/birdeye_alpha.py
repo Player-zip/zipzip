@@ -10,6 +10,8 @@ import time
 import pandas as pd
 import requests
 
+from .units import RATIO, ROI_UNIT_KEY, percent_to_ratio, ratio_from_any
+
 
 HARD_REJECT_TAGS = {"dev", "developer", "bundler", "insider", "chef", "known_deployer", "deployer", "airdrop_only"}
 RISK_TAG_MARKERS = ("sniper", "bot", "arbitrage")
@@ -126,17 +128,17 @@ def _profit_quality(items: list[dict]) -> dict:
 def _parse_pnl(payload: dict, *, detail_status: str) -> dict:
     summary = _summary_obj(payload)
     details = _detail_items(payload)
-    win_rate = _find_number(summary, ("win_rate", "winRate", "winrate"))
-    if win_rate is not None and win_rate > 1:
-        win_rate /= 100.0
+    win_rate = ratio_from_any(_find_number(summary, ("win_rate", "winRate", "winrate")))
     unique_tokens = _find_number(summary, ("unique_tokens", "uniqueTokens", "token_num", "tokenNum", "tokens"))
     total_trades = _find_number(summary, ("total_trades", "totalTrades", "trade_count", "tradeCount", "trades"))
     total_win = _find_number(summary, ("total_win", "totalWin", "winning_tokens", "winningTokens"))
     total_loss = _find_number(summary, ("total_loss", "totalLoss", "losing_tokens", "losingTokens"))
     realized_profit = _find_number(summary, ("realized_profit", "realized_pnl", "realizedProfit", "realizedPnl"))
-    realized_roi = _find_number(summary, ("realized_roi", "realizedRoi", "realized_profit_percent", "realizedProfitPercent"))
-    if realized_roi is not None and abs(realized_roi) > 5:
-        realized_roi /= 100.0
+    # A unidade vem do nome do campo, nunca da magnitude: memecoins têm ROI
+    # legítimo acima de 500%, e um ROI de 3% não pode virar 300%.
+    realized_roi = _find_number(summary, ("realized_roi", "realizedRoi"))
+    if realized_roi is None:
+        realized_roi = percent_to_ratio(_find_number(summary, ("realized_profit_percent", "realizedProfitPercent")))
 
     quality = _profit_quality(details)
     closed_summary = None
@@ -153,6 +155,7 @@ def _parse_pnl(payload: dict, *, detail_status: str) -> dict:
         "total_trades": total_trades,
         "realized_profit_30d": realized_profit,
         "realized_roi_30d": realized_roi,
+        ROI_UNIT_KEY: RATIO,
         "tokens_traded": unique_tokens,
         "new_positions_per_week": (unique_tokens / (30.0 / 7.0)) if unique_tokens is not None else None,
         "new_positions_per_week_source": "birdeye_unique_tokens_30d_proxy" if unique_tokens is not None else "missing",

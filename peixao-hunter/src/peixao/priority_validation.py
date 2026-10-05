@@ -1,33 +1,14 @@
 from __future__ import annotations
 
-import os
-
 from .adaptive_queue import adaptive_provider_limit, build_adaptive_execution_queue
 from .backtest_v23 import update_backtest
-from .chain_aware_inputs import build_chain_aware_inputs
-from .config import Settings, settings
-from .evidence_ledger import sync_provider_caches
+from .config import Settings, env_int, settings
+from .final_stage import FINAL_STAGE1, build_final_stage1, first_existing
 from .monitor_state_v23 import update_monitor_from_stage
 from .observability_v23 import publish_efficiency_snapshot, record_priority_provider_stats
 from .priority_enrichment import enrich_nansen_pnl_priority
-from .selective_alpha import build_selective_stage1
-from .selective_db import record_selective_stage1_csv
-from .state import PipelineState, utc_now
+from .state import persist_summary, safe_call, utc_now
 from .telegram_notifier import notify_alpha_wallets
-
-
-def _safe(name, fn):
-    try:
-        return fn()
-    except Exception as exc:
-        return {"status": "ERROR", "stage": name, "error": f"{type(exc).__name__}: {exc}"}
-
-
-def _first_existing(*paths):
-    for path in paths:
-        if path is not None and path.is_file():
-            return path
-    return paths[-1] if paths else None
 
 
 def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
@@ -38,17 +19,17 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
     It deliberately keeps the existing 30m/1h/6h scheduler and Nansen cooldowns.
     """
     cfg.ensure_dirs()
-    db_path = cfg.data_dir / "peixao_master.sqlite3"
+    db_path = cfg.master_db
 
-    queue = _safe("adaptive_execution_queue", lambda: build_adaptive_execution_queue(
+    queue = safe_call("adaptive_execution_queue", lambda: build_adaptive_execution_queue(
         cfg.output_dir,
         cfg.state_dir,
         db_path,
-        stale_seconds=int(os.getenv("PEIXAO_EXECUTION_QUEUE_TTL_SECONDS", str(7 * 86400))),
+        stale_seconds=env_int("PEIXAO_EXECUTION_QUEUE_TTL_SECONDS", 7 * 86400),
     ))
 
     due_by_chain = queue.get("due_by_chain") if isinstance(queue.get("due_by_chain"), dict) else {}
-    base_limit_default = max(0, int(os.getenv("PEIXAO_NANSEN_WALLETS_PER_CHAIN", "20")))
+    base_limit_default = max(0, env_int("PEIXAO_NANSEN_WALLETS_PER_CHAIN", 20))
     base_limit = adaptive_provider_limit(
         db_path, "NANSEN", "base", base_limit_default,
         backlog=int(due_by_chain.get("base", 0) or 0),
@@ -58,16 +39,16 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
         backlog=int(due_by_chain.get("robinhood", 0) or 0),
     )
 
-    base_priority = _first_existing(
+    base_priority = first_existing(
         cfg.output_dir / "V22_base_wallet_priority.csv",
         cfg.output_dir / "V22_base_wallet_candidates.csv",
     )
-    robinhood_priority = _first_existing(
+    robinhood_priority = first_existing(
         cfg.output_dir / "V22_robinhood_wallet_priority.csv",
         cfg.output_dir / "V22_robinhood_wallet_candidates.csv",
     )
 
-    base_nansen = _safe("base_nansen_pnl", lambda: enrich_nansen_pnl_priority(
+    base_nansen = safe_call("base_nansen_pnl", lambda: enrich_nansen_pnl_priority(
         base_priority,
         cfg.output_dir / "V22_base_wallet_enriched.csv",
         cfg.state_dir,
@@ -78,7 +59,7 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
         ttl_seconds=cfg.birdeye_pnl_ttl_seconds,
         max_wallets=base_limit,
     ))
-    robinhood_nansen = _safe("robinhood_nansen_pnl", lambda: enrich_nansen_pnl_priority(
+    robinhood_nansen = safe_call("robinhood_nansen_pnl", lambda: enrich_nansen_pnl_priority(
         robinhood_priority,
         cfg.output_dir / "V22_robinhood_wallet_enriched.csv",
         cfg.state_dir,
@@ -90,68 +71,36 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
         max_wallets=robinhood_limit,
     ))
 
-    provider_stats = _safe("provider_stats", lambda: record_priority_provider_stats(
+    provider_stats = safe_call("provider_stats", lambda: record_priority_provider_stats(
         db_path,
         base_nansen=base_nansen,
         robinhood_nansen=robinhood_nansen,
     ))
-    cache_sync = _safe("evidence_cache_sync", lambda: sync_provider_caches(cfg.state_dir, db_path))
-
-    legacy_input = _first_existing(
-        cfg.output_dir / "V22_legacy_robinhood_wallet_enriched.csv",
-        cfg.output_dir / "V6_wallet_queue_enriched.csv",
-    )
-    if legacy_input is None or not legacy_input.is_file():
+    final = build_final_stage1(cfg)
+    if final.get("status") == "NO_BASELINE":
         return {
             "status": "NO_BASELINE",
             "queue": queue,
             "base_nansen": base_nansen,
             "robinhood_nansen": robinhood_nansen,
             "provider_stats": provider_stats,
-            "cache_sync": cache_sync,
+            "final_stage": final,
             "finished_at": utc_now(),
         }
+    stage1 = cfg.output_dir / FINAL_STAGE1
 
-    solana_input = _first_existing(
-        cfg.output_dir / "V22_radar_wallet_enriched_quicknode.csv",
-        cfg.output_dir / "V22_quicknode_wallet_candidates.csv",
-        cfg.output_dir / "V22_radar_wallet_enriched.csv",
-    )
-    canonical_path = cfg.output_dir / "V23_canonical_wallet_inputs.csv"
-    canonical = _safe("chain_aware_canonical_inputs", lambda: build_chain_aware_inputs(
-        legacy_path=legacy_input,
-        solana_path=solana_input,
-        base_path=cfg.output_dir / "V22_base_wallet_enriched.csv",
-        robinhood_path=cfg.output_dir / "V22_robinhood_wallet_enriched.csv",
-        output_path=canonical_path,
-        db_path=db_path,
-    ))
-
-    selective = _safe("multichain_selective_alpha", lambda: build_selective_stage1(
-        legacy_input,
-        None,
-        cfg.output_dir,
-        input_override=canonical_path,
-        artifact_prefix="V22S",
-        max_deep_dive=30,
-    ))
-    selective_db = _safe("multichain_selective_db", lambda: record_selective_stage1_csv(
-        cfg.output_dir / "V22S_wallet_stage1.csv",
-        db_path,
-    ))
-
-    backtest = _safe("score_replay", lambda: update_backtest(
-        cfg.output_dir / "V22S_wallet_stage1.csv",
+    backtest = safe_call("score_replay", lambda: update_backtest(
+        stage1,
         db_path,
         cfg.output_dir / "V22_backtest_summary.csv",
     ))
-    monitor_state = _safe("monitor_state", lambda: update_monitor_from_stage(
+    monitor_state = safe_call("monitor_state", lambda: update_monitor_from_stage(
         db_path,
-        cfg.output_dir / "V22S_wallet_stage1.csv",
+        stage1,
         cfg.output_dir / "V22_execution_queue.csv",
-        refresh_seconds=int(os.getenv("PEIXAO_MONITOR_REFRESH_SECONDS", "86400")),
+        refresh_seconds=env_int("PEIXAO_MONITOR_REFRESH_SECONDS", 86400),
     ))
-    observability = _safe("efficiency_snapshot", lambda: publish_efficiency_snapshot(
+    observability = safe_call("efficiency_snapshot", lambda: publish_efficiency_snapshot(
         output_dir=cfg.output_dir,
         state_dir=cfg.state_dir,
         db_path=db_path,
@@ -159,17 +108,20 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
         backtest=backtest,
     ))
 
-    telegram = _safe("multichain_telegram", lambda: notify_alpha_wallets(
-        cfg.output_dir / "V22S_wallet_stage1.csv",
+    # Alertas só saem de uma tabela final recém-construída.
+    telegram = {"status": "SKIPPED_FINAL_STAGE_ERROR", "sent": 0} if final.get("status") == "ERROR" else safe_call("multichain_telegram", lambda: notify_alpha_wallets(
+        stage1,
         db_path,
         token=cfg.telegram_bot_token,
         chat_id=cfg.telegram_chat_id,
         enabled=cfg.telegram_alerts_enabled,
         timeout=cfg.telegram_timeout,
+        access_password=cfg.telegram_access_password,
+        auth_ttl_days=cfg.telegram_auth_ttl_days,
     ))
 
-    critical = (queue, base_nansen, robinhood_nansen, canonical, selective, selective_db)
-    status = "DONE" if all(x.get("status") not in {"ERROR", "NO_BASELINE"} for x in critical) else "PARTIAL"
+    inputs_ok = all(x.get("status") != "ERROR" for x in (queue, base_nansen, robinhood_nansen))
+    status = "DONE" if inputs_ok and final.get("status") == "DONE" else "PARTIAL"
     result = {
         "status": status,
         "mode": "PRIORITY_QUEUE_V23_DELTA",
@@ -177,10 +129,7 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
         "base_nansen": base_nansen,
         "robinhood_nansen": robinhood_nansen,
         "provider_stats": provider_stats,
-        "cache_sync": cache_sync,
-        "canonical_inputs": canonical,
-        "selective_alpha": selective,
-        "selective_db": selective_db,
+        "final_stage": final,
         "backtest": backtest,
         "monitor_state": monitor_state,
         "observability": observability,
@@ -188,18 +137,17 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
         "finished_at": utc_now(),
     }
 
-    try:
-        store = PipelineState(cfg.state_dir)
-        state = store.load()
-        state["priority_validation"] = result
-        state["priority_validation_finished_at"] = result["finished_at"]
-        state["v23_delta_active"] = True
-        state["execution_queue"] = queue
-        state["canonical_inputs"] = canonical
-        state["backtest"] = backtest
-        state["observability"] = observability
-        store.save(state)
-        store.log({"at": utc_now(), "event": "priority_validation_done", **result})
-    except Exception:
-        pass
+    persist_summary(
+        cfg.state_dir,
+        {
+            "priority_validation": result,
+            "priority_validation_finished_at": result["finished_at"],
+            "v23_delta_active": True,
+            "execution_queue": queue,
+            "final_stage": final,
+            "backtest": backtest,
+            "observability": observability,
+        },
+        {"at": utc_now(), "event": "priority_validation_done", **result},
+    )
     return result

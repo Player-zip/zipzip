@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import logging
 import os
+import traceback
+
+logger = logging.getLogger("peixao")
 
 
 def utc_now() -> str:
@@ -34,3 +38,37 @@ class PipelineState:
     def log(self, event: dict) -> None:
         with self.run_log.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def safe_call(name: str, fn):
+    """Executa uma etapa isolada: erro vira status ERROR, com traceback no log."""
+    try:
+        return fn()
+    except Exception as exc:
+        logger.exception("etapa %s falhou", name)
+        return {
+            "status": "ERROR",
+            "stage": name,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(limit=6)[-2000:],
+        }
+
+
+def persist_summary(state_dir: Path, updates: dict, event: dict) -> None:
+    """Grava o resumo do ciclo no estado e no log de execuções sem derrubar o ciclo."""
+    try:
+        store = PipelineState(state_dir)
+        state = store.load()
+        state.update(updates)
+        store.save(state)
+        store.log(event)
+    except Exception:
+        logger.exception("falha ao persistir o estado do pipeline")
+
+
+def atomic_csv(frame, path: Path) -> None:
+    """Escreve CSV via arquivo temporário + rename (leitor nunca vê arquivo pela metade)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    frame.to_csv(tmp, index=False)
+    os.replace(tmp, path)

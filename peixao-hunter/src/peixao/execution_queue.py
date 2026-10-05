@@ -5,9 +5,12 @@ from pathlib import Path
 import json
 import math
 import os
+import threading
 import time
 
 import pandas as pd
+
+from .state import atomic_csv
 
 
 def _now_iso() -> str:
@@ -120,7 +123,7 @@ def _merge_source_rows(left: dict | None, right: dict) -> dict:
     return merged
 
 
-def build_execution_queue(
+def _build_execution_queue(
     output_dir: Path,
     state_dir: Path,
     *,
@@ -217,13 +220,13 @@ def build_execution_queue(
             ascending=[False, False, False],
             kind="mergesort",
         ).reset_index(drop=True)
-    queue.to_csv(out_path, index=False)
+    atomic_csv(queue, out_path)
 
     by_chain: dict[str, int] = {}
     for chain in ("solana", "base", "robinhood"):
         chain_path = output_dir / f"V22_{chain}_wallet_priority.csv"
         subset = queue[queue["chain"].eq(chain)].copy() if not queue.empty and "chain" in queue.columns else pd.DataFrame()
-        subset.to_csv(chain_path, index=False)
+        atomic_csv(subset, chain_path)
         by_chain[chain] = int(len(subset))
 
     _atomic_json(state_path, {"updated_epoch": now, "updated_at": now_iso, "entries": entries})
@@ -235,3 +238,12 @@ def build_execution_queue(
         "output": str(out_path),
         "stale_seconds": int(stale_seconds),
     }
+
+
+# A fila é reconstruída pelo ciclo principal e pela thread do stream.
+EXECUTION_QUEUE_LOCK = threading.RLock()
+
+
+def build_execution_queue(*args, **kwargs) -> dict:
+    with EXECUTION_QUEUE_LOCK:
+        return _build_execution_queue(*args, **kwargs)

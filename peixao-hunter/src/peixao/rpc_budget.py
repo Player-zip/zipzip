@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import sqlite3
+import threading
 from typing import Callable
+from urllib.parse import urlparse
 
 
 DEFAULT_STAGE_LIMITS = {
@@ -177,3 +180,118 @@ class RpcBudgetManager:
             "stages": stages,
             "fail_closed_unknown_stage": True,
         }
+
+
+# ---------------------------------------------------------------------------
+# Teto diário persistente por provedor para os caminhos de RPC fora do
+# pipeline legado (varredura de logs da Robinhood, checagens de EOA do stream,
+# JSON-RPC da Alchemy). É uma trava contra loops descontrolados: o padrão é
+# folgado e cada provedor pode ser ajustado por ambiente (0 = sem teto).
+# ---------------------------------------------------------------------------
+
+DEFAULT_DAILY_LIMITS = {
+    "robinhood_rpc": 50_000,
+    "quicknode_evm": 50_000,
+    "drpc": 50_000,
+    "alchemy": 50_000,
+}
+
+
+def rpc_provider_for_url(url: str | None) -> str:
+    host = (urlparse(str(url or "")).hostname or "").lower()
+    if "alchemy" in host:
+        return "alchemy"
+    if "quiknode" in host or "quicknode" in host:
+        return "quicknode_evm"
+    if "drpc" in host:
+        return "drpc"
+    return "robinhood_rpc"
+
+
+def daily_limit_for(provider: str) -> int:
+    name = "PEIXAO_RPC_DAILY_LIMIT_" + str(provider).upper()
+    raw = os.getenv(name, "").strip()
+    if raw:
+        try:
+            return max(0, int(float(raw)))
+        except ValueError:
+            pass
+    return int(DEFAULT_DAILY_LIMITS.get(str(provider), 50_000))
+
+
+class DailyCallLimiter:
+    def __init__(self, db_path: Path, *, now_fn: Callable[[], datetime] | None = None) -> None:
+        self.db_path = Path(db_path)
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self._lock = threading.Lock()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provider_daily_usage (
+                    day_key TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    used INTEGER NOT NULL DEFAULT 0,
+                    denied INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (day_key, provider)
+                )
+                """
+            )
+
+    def try_consume(self, provider: str, *, limit: int | None = None, cost: int = 1) -> bool:
+        provider = str(provider)
+        limit = daily_limit_for(provider) if limit is None else max(0, int(limit))
+        cost = max(1, int(cost))
+        day_key = self._now_fn().astimezone(timezone.utc).strftime("%Y-%m-%d")
+        with self._lock, sqlite3.connect(self.db_path, timeout=30) as conn:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            row = conn.execute(
+                "SELECT used FROM provider_daily_usage WHERE day_key=? AND provider=?",
+                (day_key, provider),
+            ).fetchone()
+            used = int(row[0]) if row else 0
+            if limit and used + cost > limit:
+                conn.execute(
+                    """
+                    INSERT INTO provider_daily_usage(day_key, provider, used, denied) VALUES (?, ?, ?, 1)
+                    ON CONFLICT(day_key, provider) DO UPDATE SET denied = denied + 1
+                    """,
+                    (day_key, provider, used),
+                )
+                return False
+            conn.execute(
+                """
+                INSERT INTO provider_daily_usage(day_key, provider, used, denied) VALUES (?, ?, ?, 0)
+                ON CONFLICT(day_key, provider) DO UPDATE SET used = used + ?
+                """,
+                (day_key, provider, cost, cost),
+            )
+            return True
+
+    def usage_today(self) -> dict[str, dict[str, int]]:
+        day_key = self._now_fn().astimezone(timezone.utc).strftime("%Y-%m-%d")
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
+            rows = conn.execute(
+                "SELECT provider, used, denied FROM provider_daily_usage WHERE day_key=?", (day_key,)
+            ).fetchall()
+        return {str(r[0]): {"used": int(r[1]), "denied": int(r[2]), "limit": daily_limit_for(str(r[0]))} for r in rows}
+
+
+_LIMITERS: dict[str, DailyCallLimiter] = {}
+_LIMITERS_LOCK = threading.Lock()
+
+
+def daily_limiter() -> DailyCallLimiter:
+    from .config import settings
+
+    path = settings.data_dir / "rpc_budget.sqlite3"
+    key = str(path.resolve()) if path.parent.exists() else str(path)
+    with _LIMITERS_LOCK:
+        if key not in _LIMITERS:
+            _LIMITERS[key] = DailyCallLimiter(path)
+        return _LIMITERS[key]
+
+
+def consume_daily_rpc(url: str | None, cost: int = 1) -> bool:
+    """Reserva uma chamada no teto diário do provedor da URL (True = pode chamar)."""
+    return daily_limiter().try_consume(rpc_provider_for_url(url), cost=cost)

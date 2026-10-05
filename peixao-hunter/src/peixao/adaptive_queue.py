@@ -7,8 +7,9 @@ import time
 import pandas as pd
 
 from .evidence_ledger import monitor_state_map, normalize_chain, provider_health, wallet_key
-from .execution_queue import build_execution_queue
+from .execution_queue import EXECUTION_QUEUE_LOCK, build_execution_queue
 from .monitor_state_v23 import activity_marker
+from .state import atomic_csv
 
 
 def _read(path: Path) -> pd.DataFrame:
@@ -73,11 +74,22 @@ def build_adaptive_execution_queue(
     *,
     stale_seconds: int = 7 * 86400,
 ) -> dict:
+    with EXECUTION_QUEUE_LOCK:
+        return _build_adaptive_execution_queue(output_dir, state_dir, db_path, stale_seconds=stale_seconds)
+
+
+def _build_adaptive_execution_queue(
+    output_dir: Path,
+    state_dir: Path,
+    db_path: Path,
+    *,
+    stale_seconds: int = 7 * 86400,
+) -> dict:
     base = build_execution_queue(output_dir, state_dir, stale_seconds=stale_seconds)
     queue = _read(output_dir / "V22_execution_queue.csv")
     out_path = output_dir / "V22_execution_queue_adaptive.csv"
     if queue.empty or "address" not in queue.columns:
-        queue.to_csv(out_path, index=False)
+        atomic_csv(queue, out_path)
         return {
             **base, "adaptive": True, "due_wallets": 0,
             "monitor_suppressed": 0, "output": str(out_path),
@@ -121,15 +133,15 @@ def build_adaptive_execution_queue(
         ["monitor_due", "adaptive_priority_score", "execution_priority_score"],
         ascending=[False, False, False], kind="mergesort",
     ).reset_index(drop=True)
-    out.to_csv(out_path, index=False)
-    out.to_csv(output_dir / "V22_execution_queue.csv", index=False)
+    atomic_csv(out, out_path)
+    atomic_csv(out, output_dir / "V22_execution_queue.csv")
 
     by_chain: dict[str, int] = {}
     due_by_chain: dict[str, int] = {}
     for chain in ("solana", "base", "robinhood"):
         subset = out[out["chain"].astype(str).str.lower().eq(chain)].copy()
         due_subset = subset[subset["monitor_due"].eq(True)].copy()
-        due_subset.to_csv(output_dir / f"V22_{chain}_wallet_priority.csv", index=False)
+        atomic_csv(due_subset, output_dir / f"V22_{chain}_wallet_priority.csv")
         by_chain[chain] = int(len(subset))
         due_by_chain[chain] = int(len(due_subset))
     return {

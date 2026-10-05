@@ -3,6 +3,9 @@ import html, json, sqlite3, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 import pandas as pd
 
+from .evidence_ledger import infer_chain, normalize_address, wallet_key
+from .telegram_auth import authorized_chat_ids, ensure_auth_schema
+
 def _truthy(v):
     return v if isinstance(v, bool) else str(v).strip().lower() in {"1","true","yes","y"}
 
@@ -21,7 +24,8 @@ def _wr(v):
 
 def _message(r):
     address=str(r.get("address","")).strip()
-    chain=str(r.get("chain","Solana") or "Solana").title()
+    # Mesma regra de rede do /status: linha legada sem `chain` é Robinhood, não Solana.
+    chain=infer_chain(r).title()
     coverage=float(r.get("selective_evidence_coverage",0) or 0)*100
     return (
         "🐟 <b>RAULLUX ALPHA — WALLET ALPHA ENCONTRADA</b>\n\n"
@@ -49,7 +53,15 @@ def _send(token, chat_id, text, timeout):
     except Exception as exc:
         return {"ok":False,"http_status":None,"error":type(exc).__name__}
 
-def notify_alpha_wallets(stage1_path:Path, db_path:Path, *, token, chat_id=None, enabled=True, timeout=10.0):
+def _recipients(conn, access_password=None, auth_ttl_days=0):
+    """Só sessões válidas: com a senha vigente e dentro da validade."""
+    if access_password:
+        return authorized_chat_ids(conn, access_password, ttl_days=auth_ttl_days)
+    ensure_auth_schema(conn)
+    return [str(r[0]) for r in conn.execute("SELECT chat_id FROM telegram_auth WHERE authorized=1").fetchall()]
+
+def notify_alpha_wallets(stage1_path:Path, db_path:Path, *, token, chat_id=None, enabled=True, timeout=10.0,
+                         access_password=None, auth_ttl_days=0):
     if not enabled: return {"status":"DISABLED","sent":0}
     if not token: return {"status":"NOT_CONFIGURED","sent":0}
     if not stage1_path.is_file(): return {"status":"NO_STAGE1_FILE","sent":0}
@@ -62,29 +74,36 @@ def notify_alpha_wallets(stage1_path:Path, db_path:Path, *, token, chat_id=None,
     eligible=frame[alpha_gate].copy()
     if eligible.empty: return {"status":"DONE","eligible":0,"sent":0,"recipients":0,"duplicates_skipped":0}
     db_path.parent.mkdir(parents=True,exist_ok=True)
-    conn=sqlite3.connect(db_path)
+    conn=sqlite3.connect(db_path, timeout=30)
     try:
-        conn.execute("""CREATE TABLE IF NOT EXISTS telegram_auth (
-          chat_id TEXT PRIMARY KEY, authorized INTEGER NOT NULL DEFAULT 0,
-          awaiting_password INTEGER NOT NULL DEFAULT 0, authorized_at TEXT)""")
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("""CREATE TABLE IF NOT EXISTS telegram_alpha_deliveries (
           address TEXT NOT NULL, score_version TEXT NOT NULL, chat_id TEXT NOT NULL,
           sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_tier TEXT, last_score REAL,
           PRIMARY KEY(address,score_version,chat_id))""")
-        recipients=[str(r[0]) for r in conn.execute("SELECT chat_id FROM telegram_auth WHERE authorized=1").fetchall()]
+        recipients=_recipients(conn, access_password, auth_ttl_days)
         sent=skipped=errors=0
         for _,r in eligible.iterrows():
-            address=str(r.get("address","")).strip()
-            if not address: continue
+            raw_address=str(r.get("address","")).strip()
+            if not raw_address: continue
+            chain=infer_chain(r)
+            address=normalize_address(chain, raw_address)
+            # Chave de entrega por chain:address (a mesma wallet EVM em duas redes
+            # gera dois alertas). Entregas antigas foram gravadas só com o endereço.
+            delivery_key=wallet_key(chain, address)
+            legacy_keys=(delivery_key, address, raw_address)
             version=str(r.get("selective_score_version","V2.2S1"))
             score=r.get("selective_alpha_score")
             for recipient in recipients:
-                if conn.execute("SELECT 1 FROM telegram_alpha_deliveries WHERE address=? AND score_version=? AND chat_id=?",(address,version,recipient)).fetchone():
+                if conn.execute(
+                    "SELECT 1 FROM telegram_alpha_deliveries WHERE address IN (?,?,?) AND score_version=? AND chat_id=?",
+                    (*legacy_keys, version, recipient),
+                ).fetchone():
                     skipped+=1; continue
                 result=_send(token,recipient,_message(r),timeout)
                 if result.get("ok"):
-                    conn.execute("INSERT INTO telegram_alpha_deliveries(address,score_version,chat_id,last_tier,last_score) VALUES(?,?,?,?,?)",
-                      (address,version,recipient,str(r.get("selective_alpha_tier","")),None if pd.isna(score) else float(score)))
+                    conn.execute("INSERT OR REPLACE INTO telegram_alpha_deliveries(address,score_version,chat_id,last_tier,last_score) VALUES(?,?,?,?,?)",
+                      (delivery_key,version,recipient,str(r.get("selective_alpha_tier","")),None if pd.isna(score) else float(score)))
                     conn.commit(); sent+=1
                 else: errors+=1
         return {"status":"DONE" if errors==0 else "PARTIAL","eligible":int(len(eligible)),
@@ -102,7 +121,7 @@ def send_simulation_alert(*, token, db_path: Path, address, chain="Base", label=
                           pnl=None, pnl_pct=None, win_rate=None, buys=None, sells=None,
                           buy_volume=None, sell_volume=None, profile=None,
                           alpha_score=None, tier=None, positions_per_week=None,
-                          timeout=10.0):
+                          timeout=10.0, access_password=None, auth_ttl_days=0):
     """Send a marked, data-rich simulation to all authorized Telegram recipients."""
     if not token:
         return {"status":"NOT_CONFIGURED","sent":0,"recipients":0}
@@ -111,12 +130,9 @@ def send_simulation_alert(*, token, db_path: Path, address, chain="Base", label=
         return {"status":"INVALID_ADDRESS","sent":0,"recipients":0}
     if not db_path.is_file():
         return {"status":"NO_AUTH_DB","sent":0,"recipients":0}
-    conn=sqlite3.connect(db_path)
+    conn=sqlite3.connect(db_path, timeout=30)
     try:
-        try:
-            recipients=[str(r[0]) for r in conn.execute("SELECT chat_id FROM telegram_auth WHERE authorized=1").fetchall()]
-        except sqlite3.OperationalError:
-            return {"status":"NO_AUTH_TABLE","sent":0,"recipients":0}
+        recipients=_recipients(conn, access_password, auth_ttl_days)
     finally:
         conn.close()
 

@@ -10,6 +10,8 @@ import time
 import pandas as pd
 import requests
 
+from .units import RATIO, ROI_UNIT_KEY, percent_to_ratio, strict_ratio
+
 
 NANSEN_BASE_URL = "https://api.nansen.ai/api/v1"
 
@@ -136,10 +138,28 @@ def _profit_distribution(rows: list[dict]) -> dict:
     }
 
 
+def upgrade_cached_metrics(metrics):
+    """Converte entradas de cache antigas (ROI em pontos percentuais) para razão.
+
+    Entradas gravadas antes da marcação de unidade guardavam
+    ``realized_pnl_percent`` bruto em ``realized_roi_30d``.
+    """
+    if not isinstance(metrics, dict) or metrics.get(ROI_UNIT_KEY):
+        return metrics
+    upgraded = dict(metrics)
+    raw = _float(upgraded.get("realized_roi_30d"))
+    if raw is not None:
+        upgraded["nansen_roi_raw_percent"] = raw
+        upgraded["realized_roi_30d"] = percent_to_ratio(raw)
+    upgraded[ROI_UNIT_KEY] = RATIO
+    return upgraded
+
+
 def _normalized_metrics(summary: dict, pnl_rows: list[dict], *, chain: str) -> dict:
-    win_rate = _float(summary.get("win_rate"))
+    # Nansen devolve win rate em razão; um valor > 1 é ambíguo e é descartado.
+    win_rate = strict_ratio(summary.get("win_rate"))
     realized_pnl = _float(summary.get("realized_pnl_usd"))
-    realized_roi = _float(summary.get("realized_pnl_percent"))
+    realized_roi_percent = _float(summary.get("realized_pnl_percent"))
     traded_tokens = _int(summary.get("traded_token_count"), 0)
     traded_times = _int(summary.get("traded_times"), 0)
     distribution = _profit_distribution(pnl_rows)
@@ -164,7 +184,9 @@ def _normalized_metrics(summary: dict, pnl_rows: list[dict], *, chain: str) -> d
         "closed_positions": closed_positions,
         "total_trades": max(0, traded_times),
         "realized_profit_30d": realized_pnl,
-        "realized_roi_30d": realized_roi,
+        "realized_roi_30d": percent_to_ratio(realized_roi_percent),
+        "nansen_roi_raw_percent": realized_roi_percent,
+        ROI_UNIT_KEY: RATIO,
         "new_positions_per_week": new_positions_per_week,
         "new_positions_per_week_source": "nansen_traded_token_count_30d_proxy",
         "tokens_traded": closed_positions,
@@ -272,7 +294,7 @@ def enrich_nansen_pnl(
             and now - int(cached.get("checked_epoch", 0) or 0) < max(0, int(ttl_seconds))
         )
         if fresh:
-            metrics = cached.get("metrics")
+            metrics = upgrade_cached_metrics(cached.get("metrics"))
         else:
             metrics, meta = _fetch_wallet(
                 key,

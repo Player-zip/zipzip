@@ -95,6 +95,7 @@ def _parse_pnl(payload: dict, *, chain: str) -> dict:
         "zerion_evidence": True,
         "zerion_pnl_method": "FIFO",
         "zerion_roi_unit": "ratio",
+        "realized_roi_unit": "ratio",
         "zerion_roi_raw_percent": raw_roi_percent,
         "realized_profit_30d": realized,
         "realized_roi_30d": roi,

@@ -6,6 +6,6 @@
     "node": "20.x"
   },
   "dependencies": {
-    "gmgn-cli": "^1.6.6"
+    "gmgn-cli": "1.6.6"
   }
 }

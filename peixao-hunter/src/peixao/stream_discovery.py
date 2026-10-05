@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import os
-
-from .config import Settings, settings
+from .config import Settings, env_bool, env_float, env_int, settings
 from .execution_queue import build_execution_queue
-from .multichain_runner import _base_discovery, _quicknode_discovery, _robinhood_discovery, _safe
+from .multichain_runner import _base_discovery, _quicknode_discovery, _robinhood_discovery, _solana_token_radar
 from .robinhood_incremental import run_robinhood_radar_incremental
-from .robinhood_stream_v2 import run_robinhood_stream_cycle
-from .state import PipelineState, utc_now
-from .token_radar import run_token_radar
+from .robinhood_stream import run_robinhood_stream_cycle
+from .state import persist_summary, safe_call, utc_now
 
 
 def _stream_enabled() -> bool:
-    return str(os.getenv("PEIXAO_ROBINHOOD_STREAM_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    return env_bool("PEIXAO_ROBINHOOD_STREAM_ENABLED", True)
 
 
 def _is_quicknode_endpoint(url: str | None) -> bool:
@@ -28,7 +25,7 @@ def _rpc_scan_fallback(cfg: Settings, *, ttl_seconds: int) -> dict:
     the free Discover plan is intentionally not used for historical eth_getLogs
     scanning because its log range is too small for our discovery workload.
     """
-    primary = str(os.getenv("ROBINHOOD_RPC_URL", "") or "").strip()
+    primary = str(cfg.robinhood_rpc_url or "").strip()
     if primary and not _is_quicknode_endpoint(primary):
         return _robinhood_discovery(cfg, ttl_seconds=ttl_seconds)
 
@@ -40,14 +37,16 @@ def _rpc_scan_fallback(cfg: Settings, *, ttl_seconds: int) -> dict:
         alchemy_api_key=cfg.alchemy_api_key,
         timeout=max(cfg.rpc_timeout, 15.0),
         ttl_seconds=ttl_seconds,
-        max_candidates=int(os.getenv("PEIXAO_ROBINHOOD_MAX_TOKENS", "40")),
-        max_shortlist=int(os.getenv("PEIXAO_ROBINHOOD_MAX_SHORTLIST", str(cfg.token_radar_max_shortlist))),
+        max_candidates=env_int("PEIXAO_ROBINHOOD_MAX_TOKENS", 40),
+        max_shortlist=env_int("PEIXAO_ROBINHOOD_MAX_SHORTLIST", cfg.token_radar_max_shortlist),
         min_cross_token_hits=cfg.birdeye_min_cross_token_hits,
-        max_wallets=int(os.getenv("PEIXAO_ROBINHOOD_MAX_WALLETS", "100")),
-        lookback_blocks=int(os.getenv("PEIXAO_ROBINHOOD_LOOKBACK_BLOCKS", "30000")),
-        chunk_blocks=int(os.getenv("PEIXAO_ROBINHOOD_LOG_CHUNK_BLOCKS", "9500")),
-        max_logs_per_token=int(os.getenv("PEIXAO_ROBINHOOD_MAX_LOGS_PER_TOKEN", "1200")),
-        max_rps=float(os.getenv("PEIXAO_ROBINHOOD_MAX_RPS", "15")),
+        max_wallets=env_int("PEIXAO_ROBINHOOD_MAX_WALLETS", 100),
+        # Janela curta própria do fallback rápido; a de 6h usa
+        # PEIXAO_ROBINHOOD_LOOKBACK_BLOCKS / PEIXAO_ROBINHOOD_LOG_CHUNK_BLOCKS.
+        lookback_blocks=env_int("PEIXAO_ROBINHOOD_FAST_LOOKBACK_BLOCKS", 30000),
+        chunk_blocks=env_int("PEIXAO_ROBINHOOD_FAST_LOG_CHUNK_BLOCKS", 9500),
+        max_logs_per_token=env_int("PEIXAO_ROBINHOOD_MAX_LOGS_PER_TOKEN", 1200),
+        max_rps=env_float("PEIXAO_ROBINHOOD_MAX_RPS", 15.0),
     )
 
 
@@ -58,18 +57,18 @@ def _stream_first_robinhood(cfg: Settings, *, ttl_seconds: int) -> dict:
     stream = run_robinhood_stream_cycle(
         cfg.output_dir,
         cfg.state_dir,
-        rpc_url=os.getenv("ROBINHOOD_RPC_URL"),
-        api_key=os.getenv("QUICKNODE_STREAMS_API_KEY"),
-        webhook_url=os.getenv("PEIXAO_ROBINHOOD_STREAM_WEBHOOK_URL"),
+        rpc_url=cfg.robinhood_eoa_rpc_url,
+        api_key=cfg.quicknode_streams_api_key,
+        webhook_url=cfg.robinhood_stream_webhook_url,
         timeout=max(cfg.rpc_timeout, 15.0),
         ttl_seconds=ttl_seconds,
-        max_candidates=int(os.getenv("PEIXAO_ROBINHOOD_MAX_TOKENS", "40")),
-        max_shortlist=int(os.getenv("PEIXAO_ROBINHOOD_MAX_SHORTLIST", str(cfg.token_radar_max_shortlist))),
+        max_candidates=env_int("PEIXAO_ROBINHOOD_MAX_TOKENS", 40),
+        max_shortlist=env_int("PEIXAO_ROBINHOOD_MAX_SHORTLIST", cfg.token_radar_max_shortlist),
         min_cross_token_hits=cfg.birdeye_min_cross_token_hits,
-        max_wallets=int(os.getenv("PEIXAO_ROBINHOOD_MAX_WALLETS", "100")),
-        eoa_checks_per_cycle=int(os.getenv("PEIXAO_ROBINHOOD_STREAM_EOA_CHECKS", "20")),
-        max_rps=float(os.getenv("PEIXAO_ROBINHOOD_MAX_RPS", "15")),
-        rpc_backfill_interval_seconds=int(os.getenv("PEIXAO_ROBINHOOD_RPC_BACKFILL_INTERVAL_SECONDS", "21600")),
+        max_wallets=env_int("PEIXAO_ROBINHOOD_MAX_WALLETS", 100),
+        eoa_checks_per_cycle=env_int("PEIXAO_ROBINHOOD_STREAM_EOA_CHECKS", 20),
+        max_rps=env_float("PEIXAO_ROBINHOOD_MAX_RPS", 15.0),
+        rpc_backfill_interval_seconds=env_int("PEIXAO_ROBINHOOD_RPC_BACKFILL_INTERVAL_SECONDS", 21600),
     )
     if stream.get("stream_active"):
         # The heavy 6-hour run remains the reconciliation/backfill path.
@@ -90,34 +89,19 @@ def _stream_first_robinhood(cfg: Settings, *, ttl_seconds: int) -> dict:
 def run_discovery_cycle_stream_first(*, cfg: Settings = settings) -> dict:
     """30-minute discovery with QuickNode Stream as Robinhood primary source."""
     cfg.ensure_dirs()
-    fast_ttl = max(300, int(os.getenv("PEIXAO_FAST_RADAR_TTL_SECONDS", "600")))
+    fast_ttl = max(300, env_int("PEIXAO_FAST_RADAR_TTL_SECONDS", 600))
 
     # Bring the Robinhood Stream up first. This makes stream availability
     # independent of slower Solana holder refreshes and starts receiving events
     # as early as possible after a Railway restart.
-    robinhood = _safe("fast_robinhood_stream", lambda: _stream_first_robinhood(cfg, ttl_seconds=fast_ttl))
-
-    solana_radar = _safe("fast_solana_radar", lambda: run_token_radar(
+    robinhood = safe_call("fast_robinhood_stream", lambda: _stream_first_robinhood(cfg, ttl_seconds=fast_ttl))
+    solana_radar = safe_call("fast_solana_radar", lambda: _solana_token_radar(cfg, ttl_seconds=fast_ttl))
+    solana_wallets = safe_call("fast_quicknode_solana", lambda: _quicknode_discovery(cfg))
+    base = safe_call("fast_base_radar", lambda: _base_discovery(cfg, ttl_seconds=fast_ttl))
+    queue = safe_call("fast_execution_queue", lambda: build_execution_queue(
         cfg.output_dir,
         cfg.state_dir,
-        cfg.data_dir / "peixao_master.sqlite3",
-        jupiter_api_key=cfg.jupiter_api_key,
-        jupiter_base_url=cfg.jupiter_base_url,
-        dexscreener_base_url=cfg.dexscreener_base_url,
-        timeout=cfg.jupiter_timeout,
-        ttl_seconds=fast_ttl,
-        max_candidates=int(os.getenv("PEIXAO_SOLANA_MAX_TOKENS", str(cfg.token_radar_max_candidates))),
-        max_shortlist=int(os.getenv("PEIXAO_SOLANA_MAX_SHORTLIST", str(cfg.token_radar_max_shortlist))),
-        min_liquidity_usd=cfg.token_radar_min_liquidity_usd,
-        min_volume_24h_usd=cfg.token_radar_min_volume_24h_usd,
-        min_radar_score=cfg.token_radar_min_score,
-    ))
-    solana_wallets = _safe("fast_quicknode_solana", lambda: _quicknode_discovery(cfg))
-    base = _safe("fast_base_radar", lambda: _base_discovery(cfg, ttl_seconds=fast_ttl))
-    queue = _safe("fast_execution_queue", lambda: build_execution_queue(
-        cfg.output_dir,
-        cfg.state_dir,
-        stale_seconds=int(os.getenv("PEIXAO_EXECUTION_QUEUE_TTL_SECONDS", str(7 * 86400))),
+        stale_seconds=env_int("PEIXAO_EXECUTION_QUEUE_TTL_SECONDS", 7 * 86400),
     ))
 
     summary = {
@@ -130,14 +114,13 @@ def run_discovery_cycle_stream_first(*, cfg: Settings = settings) -> dict:
         "execution_queue": queue,
         "finished_at": utc_now(),
     }
-    try:
-        store = PipelineState(cfg.state_dir)
-        state = store.load()
-        state["fast_discovery"] = summary
-        state["fast_discovery_finished_at"] = summary["finished_at"]
-        state["robinhood_stream_first"] = bool(robinhood.get("stream_active"))
-        store.save(state)
-        store.log({"at": utc_now(), "event": "fast_discovery_done", **summary})
-    except Exception:
-        pass
+    persist_summary(
+        cfg.state_dir,
+        {
+            "fast_discovery": summary,
+            "fast_discovery_finished_at": summary["finished_at"],
+            "robinhood_stream_first": bool(robinhood.get("stream_active")),
+        },
+        {"at": utc_now(), "event": "fast_discovery_done", **summary},
+    )
     return summary

@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import os
-import shutil
 import zipfile
 
 import gdown
@@ -39,13 +38,22 @@ def project_seed_ready(cfg: Settings) -> bool:
     return True
 
 
-def _safe_extract(archive: Path, destination: Path) -> None:
+DEFAULT_BOOTSTRAP_MAX_UNCOMPRESSED_BYTES = 5 * 1024 ** 3
+
+
+def _safe_extract(archive: Path, destination: Path, *, max_uncompressed_bytes: int | None = None) -> None:
     destination = destination.resolve()
+    limit = int(max_uncompressed_bytes or os.getenv("PEIXAO_BOOTSTRAP_MAX_BYTES", DEFAULT_BOOTSTRAP_MAX_UNCOMPRESSED_BYTES))
     with zipfile.ZipFile(archive) as zf:
+        total = 0
         for info in zf.infolist():
             target = (destination / info.filename).resolve()
             if destination != target and destination not in target.parents:
                 raise ValueError(f"unsafe bootstrap archive path: {info.filename}")
+            total += int(info.file_size)
+        # Zip bomb: o tamanho declarado descompactado não pode estourar o volume.
+        if total > limit:
+            raise ValueError(f"bootstrap archive too large when extracted: {total} bytes > {limit}")
         zf.extractall(destination)
 
 

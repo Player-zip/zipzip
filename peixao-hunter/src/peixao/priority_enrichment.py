@@ -2,19 +2,19 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-import os
 import time
 
 import pandas as pd
 
-from .nansen_evm import _atomic_json, _fetch_wallet, _load_json
+from .config import env_int
+from .nansen_evm import _atomic_json, _fetch_wallet, _load_json, upgrade_cached_metrics
 
 
 def _cooldown_seconds(statuses: list[int]) -> int:
     if 403 in statuses:
-        return max(300, int(os.getenv("PEIXAO_NANSEN_403_COOLDOWN", "21600")))
+        return max(300, env_int("PEIXAO_NANSEN_403_COOLDOWN", 21600))
     if 429 in statuses:
-        return max(60, int(os.getenv("PEIXAO_NANSEN_429_COOLDOWN", "3600")))
+        return max(60, env_int("PEIXAO_NANSEN_429_COOLDOWN", 3600))
     return 0
 
 
@@ -79,7 +79,7 @@ def enrich_nansen_pnl_priority(
             cached.get("metrics")
             and now - int(cached.get("checked_epoch", 0) or 0) < max(0, int(ttl_seconds))
         )
-        metrics = cached.get("metrics") if fresh else None
+        metrics = upgrade_cached_metrics(cached.get("metrics")) if fresh else None
         if fresh:
             cache_hits += 1
         elif not provider_blocked and live_attempts < live_limit:

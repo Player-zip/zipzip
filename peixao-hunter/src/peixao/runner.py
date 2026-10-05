@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import time
 
 from .alpha_db import record_alpha22_stage1_csv
@@ -13,13 +12,12 @@ from .gmgn_live import probe_gmgn_live
 from .jupiter import probe_jupiter
 from .mobula import probe_mobula
 from .rpc_budget import RpcBudgetManager
-from .quicknode_solana import merge_quicknode_with_birdeye, run_quicknode_solana_discovery
+from .quicknode_solana import merge_quicknode_with_birdeye, quicknode_solana_enabled, run_quicknode_solana_from_settings
 from .solana_tracker import probe_solana_tracker
 from .selective_alpha import build_selective_stage1
-from .selective_db import record_selective_stage1_csv
-from .state import PipelineState, utc_now
+from .state import PipelineState, logger, utc_now
 from .token_radar import run_token_radar
-from .telegram_notifier import notify_alpha_wallets, send_test_alert_once
+from .telegram_notifier import send_test_alert_once
 from .wallet_db import record_ranked_v1_csv
 from .pipeline import (
     discover_offline,
@@ -89,8 +87,9 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         state_store.save(state)
         try:
             result = fn()
-            status = "DONE"
+            status = "ERROR" if isinstance(result, dict) and result.get("status") == "ERROR" else "DONE"
         except Exception as exc:
+            logger.exception("etapa opcional %s falhou", name)
             result = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"}
             status = "ERROR"
             state_store.log({"at": utc_now(), "event": "optional_stage_error", "stage": name, "error": str(exc)})
@@ -136,7 +135,7 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
     ))
 
     if cfg.gmgn_live_probe:
-        gmgn_live_summary = stage("08_gmgn_live_probe", lambda: probe_gmgn_live(
+        gmgn_live_summary = optional_stage("08_gmgn_live_probe", lambda: probe_gmgn_live(
             cfg.output_dir, cfg.state_dir, api_key=cfg.gmgn_api_key,
             demo_enabled=cfg.gmgn_demo_enabled, chain=cfg.gmgn_chain, timeout=cfg.gmgn_live_timeout,
         ))
@@ -144,7 +143,7 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         gmgn_live_summary = {"status": "DISABLED"}
 
     if cfg.mobula_probe_enabled:
-        mobula_summary = stage("08b_mobula_probe", lambda: probe_mobula(
+        mobula_summary = optional_stage("08b_mobula_probe", lambda: probe_mobula(
             cfg.state_dir, api_key=cfg.mobula_api_key, base_url=cfg.mobula_base_url,
             timeout=cfg.mobula_timeout, ttl_seconds=cfg.mobula_probe_ttl_seconds,
         ))
@@ -152,7 +151,7 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         mobula_summary = {"status": "DISABLED", "cached": False, "http_calls": 0}
 
     if cfg.jupiter_probe_enabled:
-        jupiter_summary = stage("08c_jupiter_probe", lambda: probe_jupiter(
+        jupiter_summary = optional_stage("08c_jupiter_probe", lambda: probe_jupiter(
             cfg.state_dir, api_key=cfg.jupiter_api_key, base_url=cfg.jupiter_base_url,
             timeout=cfg.jupiter_timeout, ttl_seconds=cfg.jupiter_probe_ttl_seconds,
         ))
@@ -160,7 +159,7 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         jupiter_summary = {"status": "DISABLED", "cached": False, "http_calls": 0}
 
     if cfg.solana_tracker_probe_enabled:
-        solana_tracker_summary = stage("08d_solana_tracker_probe", lambda: probe_solana_tracker(
+        solana_tracker_summary = optional_stage("08d_solana_tracker_probe", lambda: probe_solana_tracker(
             cfg.state_dir, api_key=cfg.solana_tracker_api_key, base_url=cfg.solana_tracker_base_url,
             timeout=cfg.solana_tracker_timeout, ttl_seconds=cfg.solana_tracker_probe_ttl_seconds,
         ))
@@ -168,7 +167,7 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         solana_tracker_summary = {"status": "DISABLED", "cached": False, "http_calls": 0}
 
     if cfg.dune_probe_enabled:
-        dune_summary = stage("08d_dune_probe", lambda: probe_dune(
+        dune_summary = optional_stage("08e_dune_probe", lambda: probe_dune(
             cfg.state_dir, api_key=cfg.dune_api_key, base_url=cfg.dune_base_url,
             timeout=cfg.dune_timeout, ttl_seconds=cfg.dune_probe_ttl_seconds,
         ))
@@ -190,26 +189,9 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
     else:
         radar_summary = {"status": "DISABLED", "http_calls": 0, "rpc_calls": 0}
 
-    quicknode_enabled = str(os.getenv("PEIXAO_QUICKNODE_SOLANA", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    quicknode_enabled = quicknode_solana_enabled()
     if quicknode_enabled:
-        quicknode_summary = optional_stage("09b_quicknode_solana", lambda: run_quicknode_solana_discovery(
-            cfg.output_dir / "V22_token_radar_shortlist.csv",
-            cfg.output_dir,
-            cfg.state_dir,
-            quicknode_rpc_url=os.getenv("QUICKNODE_RPC_URL"),
-            helius_rpc_url=cfg.helius_rpc_url,
-            shyft_rpc_url=cfg.shyft_rpc_url,
-            enabled=True,
-            timeout=float(os.getenv("PEIXAO_QUICKNODE_TIMEOUT", "20")),
-            delay=float(os.getenv("PEIXAO_QUICKNODE_DELAY", "0.075")),
-            max_tokens=int(os.getenv("PEIXAO_QUICKNODE_MAX_TOKENS", "5")),
-            max_wallets=int(os.getenv("PEIXAO_QUICKNODE_MAX_WALLETS", "25")),
-            tx_per_wallet=int(os.getenv("PEIXAO_QUICKNODE_TX_PER_WALLET", "80")),
-            daily_credit_budget=int(os.getenv("PEIXAO_QUICKNODE_DAILY_CREDITS", "330000")),
-            run_credit_budget=int(os.getenv("PEIXAO_QUICKNODE_RUN_CREDITS", "75000")),
-            call_credit_estimate=int(os.getenv("PEIXAO_QUICKNODE_CALL_CREDITS", "30")),
-            cache_ttl_seconds=int(os.getenv("PEIXAO_QUICKNODE_CACHE_TTL", "1800")),
-        ))
+        quicknode_summary = optional_stage("09b_quicknode_solana", lambda: run_quicknode_solana_from_settings(cfg))
     else:
         quicknode_summary = {"status": "DISABLED", "rpc_calls": 0, "quicknode_credits": 0}
 
@@ -252,31 +234,13 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         lookback_days=cfg.dune_selectivity_lookback_days, max_poll_seconds=cfg.dune_selectivity_poll_seconds,
     ))
 
-    selective_final_summary = optional_stage("13_selective_stage1_final", lambda: build_selective_stage1(
-        cfg.output_dir / "V6_wallet_queue_enriched.csv",
-        solana_wallet_input,
-        cfg.output_dir,
-        input_override=cfg.output_dir / "V22_wallet_dune_enriched.csv",
-        artifact_prefix="V22S",
-        max_deep_dive=30,
-    ))
-
-    selective_db_summary = optional_stage("14_selective_master_db", lambda: record_selective_stage1_csv(
-        cfg.output_dir / "V22S_wallet_stage1.csv", cfg.data_dir / "peixao_master.sqlite3",
-    ))
+    # A tabela final (V22S_wallet_stage1.csv), o registro no banco e os alertas
+    # saem de final_stage.build_final_stage1, chamado pelo multichain_runner e
+    # pelo ciclo horário. Este runner só produz insumos (incluindo o cache Dune).
 
     telegram_test_summary = optional_stage("15a_telegram_test_once", lambda: send_test_alert_once(
         cfg.state_dir, token=cfg.telegram_bot_token, chat_id=cfg.telegram_chat_id,
         enabled=cfg.telegram_test_once, timeout=cfg.telegram_timeout,
-    ))
-
-    telegram_summary = optional_stage("15b_telegram_alpha_alerts", lambda: notify_alpha_wallets(
-        cfg.output_dir / "V22S_wallet_stage1.csv",
-        cfg.data_dir / "peixao_master.sqlite3",
-        token=cfg.telegram_bot_token,
-        chat_id=cfg.telegram_chat_id,
-        enabled=cfg.telegram_alerts_enabled,
-        timeout=cfg.telegram_timeout,
     ))
 
     validation = validate_against_v5(cfg.v5_reference_dir, cfg.output_dir) if validate_against_reference else []
@@ -298,10 +262,7 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         "quicknode_birdeye_merge": quicknode_merge_summary,
         "selective_pre_dune": selective_pre_summary,
         "dune_selectivity": dune_selective_summary,
-        "selective_alpha": selective_final_summary,
-        "selective_db": selective_db_summary,
         "telegram_test": telegram_test_summary,
-        "telegram": telegram_summary,
         "master_wallet_db": master_db_summary,
         "rpc_budget": rpc_budget_summary,
     }

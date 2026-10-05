@@ -48,9 +48,24 @@ def _pick_probe_wallet(output_dir: Path) -> str | None:
     return None
 
 
-def _run_read_only(cli: str, args: list[str], api_key: str, timeout: int) -> dict:
-    env = os.environ.copy()
+# Só o necessário para o Node rodar (e passar pelo proxy/CA, se houver).
+# Nunca repassar o ambiente inteiro: ele contém as chaves de Nansen, Telegram,
+# QuickNode, Birdeye, Dune etc., e o CLI é um pacote npm de terceiros.
+_CLI_ENV_ALLOWLIST = (
+    "PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR",
+    "NODE_PATH", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+)
+
+
+def _cli_env(api_key: str) -> dict[str, str]:
+    env = {name: os.environ[name] for name in _CLI_ENV_ALLOWLIST if name in os.environ}
     env["GMGN_API_KEY"] = api_key
+    return env
+
+
+def _run_read_only(cli: str, args: list[str], api_key: str, timeout: int) -> dict:
+    env = _cli_env(api_key)
     cmd = [cli] + args + ["--raw"]
     try:
         proc = subprocess.run(

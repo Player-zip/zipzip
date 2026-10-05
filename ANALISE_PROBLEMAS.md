@@ -1,7 +1,9 @@
 # Peixão Hunter — análise dos principais problemas
 
 Objeto: `peixao-hunter-main` (commit `42191b0`, ~15 mil linhas Python, 56 módulos).
-Caminhos abaixo são relativos à raiz desse projeto.
+Caminhos e números de linha abaixo se referem ao código **original**, relativos à raiz desse projeto.
+
+> **Status:** os itens 1 a 21 foram corrigidos em `peixao-hunter/`. Veja a tabela [Correções aplicadas](#correções-aplicadas) no fim deste documento.
 
 **Estado verificado**
 
@@ -21,13 +23,13 @@ O arquivo `V22S_wallet_stage1.csv` é a fonte de `/status`, `/wallets_bs` e dos 
 | Ciclo | Onde | Identidade da wallet | Usa Dune? | Normaliza unidades? |
 |---|---|---|---|---|
 | 6h (legado) | `runner.py:255-262` | só `address` | sim | não |
-| 6h (multichain, logo depois) | `multichain_runner.py:389-395` | só `address` | **não** | não |
+| 6h (multichain, logo depois) | `multichain_runner.py:246-252` | só `address` | **não** | não |
 | 1h (V2.3) | `priority_validation.py:130-137` | `chain:address` | não | sim (ledger) |
 
 Consequências:
 - No mesmo ciclo de 6h, a validação Dune paga (`runner.py:247`) é calculada e logo descartada, porque o multichain reescreve a tabela sem o `input_override` do Dune.
 - O score de uma wallet muda conforme o último ciclo que rodou.
-- O ciclo de 6h dispara `notify_alpha_wallets` **duas vezes** (`runner.py:273` e `multichain_runner.py:402`), sobre duas versões diferentes da tabela.
+- O ciclo de 6h dispara `notify_alpha_wallets` **duas vezes** (`runner.py:273` e `multichain_runner.py:259`), sobre duas versões diferentes da tabela.
 
 **Correção:** um único construtor da tabela final (o caminho chain-aware da V2.3, com Dune incluído). Os outros ciclos só alimentam insumos. Os alertas saem de um único ponto.
 
@@ -101,7 +103,7 @@ As wallets legadas V6 (Robinhood) chegam sem a coluna `chain`. `telegram_notifie
 ### 13. Scheduler single-thread e trabalho duplicado
 - O ciclo pesado de 6h (`run_v6`) bloqueia o loop do `worker_daemon.py`. Enquanto ele roda, param a materialização do stream, o discovery de 30 min e a validação horária.
 - O ciclo de 6h refaz o discovery rápido (radar de tokens, QuickNode Solana, Base, Robinhood), com custo duplicado.
-- `_safe` e `except Exception: pass` engolem exceções sem traceback (`multichain_runner.py:165`, `priority_validation.py:19`, `stream_discovery.py:141`).
+- `_safe` e `except Exception: pass` engolem exceções sem traceback (`multichain_runner.py:22`, `priority_validation.py:19`, `stream_discovery.py:141`).
 
 ### 14. Um provedor novo pode derrubar o ciclo validado
 Os probes de GMGN, Mobula, Jupiter, Solana Tracker e Dune rodam com `stage()`, que faz `raise` (`runner.py:138-176`). Isso contradiz o comentário "New providers must never take down the validated V6 worker". Por exemplo, um JSON inválido com HTTP 200 em `dune._usage_summary` aborta tudo antes do Selective Alpha e dos alertas. A chave de etapa `08d` também está duplicada.
@@ -160,3 +162,56 @@ Na raiz do `peixao-hunter-main`, com as dependências instaladas:
 python /caminho/analise/repro_units.py    # itens 2 e 8
 python /caminho/analise/repro_stream.py   # itens 3 e 4
 ```
+
+---
+
+## Correções aplicadas
+
+O código original foi importado sem alterações num commit próprio, e as correções vieram por cima, em `peixao-hunter/`.
+
+| Verificação | Antes | Depois |
+|---|---|---|
+| Testes (`pytest -q`) | 59 | 98, todos passando |
+| Cobertura | 40% | 54% |
+| `pyflakes` / `ruff` (E9, F, B) | avisos | limpos |
+
+| # | Correção | Onde | Teste |
+|---|---|---|---|
+| 1 | Um único construtor da tabela final, usado pelos ciclos de 1h e de 6h, com identidade `chain:address`, métricas do ledger e Dune pelo cache. O runner legado não escreve mais a tabela nem envia alertas; cada ciclo alerta uma vez. | `final_stage.py`, `runner.py`, `multichain_runner.py`, `priority_validation.py` | `test_final_stage.py`, `test_v6_cycle_wiring.py`, `test_cycles_smoke.py` |
+| 1b | Bug novo, achado pelo teste: no ciclo horário, wallets Base/Robinhood "em monitoramento" sumiam da tabela final por uma hora. Agora a tabela parte da fila completa. | `final_stage._evm_chain_input` | `test_cycles_smoke.py` |
+| 2 | `units.py`: taxas sempre em razão e nunca cortadas. O Nansen grava o ROI em razão com `realized_roi_unit`, e o cache antigo é convertido na leitura. No Birdeye, a unidade vem do nome do campo. O ledger confia no marcador de unidade e trata GMGN/Birdeye como razão. | `units.py`, `nansen_evm.py`, `birdeye_alpha.py`, `zerion_evm.py`, `alpha_v22.py`, `selective_alpha.py`, `evidence_ledger.py` | `test_units_and_scores.py` |
+| 3 | Materialização em três fases, com a rede fora do lock, e lock próprio entre materializações. Entregas contadas por contador, não por segundo. Estado em JSON compacto. CSV escrito de forma atômica. | `robinhood_stream.py` | `test_stream_hardening.py` |
+| 4 | Falha de RPC vira "desconhecido" e não é cacheada (stream e varredura incremental). Sem `ROBINHOOD_RPC_URL`, a checagem usa `PEIXAO_RPC_URL`; sem nenhum RPC, o status é `RPC_URL_MISSING`. | `robinhood_chainstack.py`, `robinhood_stream.py`, `robinhood_incremental.py`, `config.py` | `test_stream_hardening.py` |
+| 5 | Login com bloqueio por tentativas, impressão PBKDF2 da senha (trocar a senha revoga as sessões), validade opcional, `/logout`, `deleteMessage` na senha, `compare_digest`, offset salvo por update com isolamento de erro, e SQLite com WAL e timeout. Os alertas só vão para sessões válidas. | `telegram_auth.py`, `telegram_notifier.py` | `test_telegram_security.py` |
+| 6 | `gmgn-cli` roda com ambiente mínimo, versão exata `1.6.6` e `package-lock.json`. | `gmgn_live.py`, `package.json`, `package-lock.json` | `test_telegram_security.py` |
+| 7 | Limite de corpo (413), gzip descompactado com limite, cache de nonce (replay é tratado como duplicado) e servidor testável (`build_stream_server`). | `robinhood_stream.py` | `test_stream_hardening.py` |
+| 8 | Ledger: janela de frescor (prioridade vale dentro dela), valor repetido só atualiza a data, retenção com `prune_evidence`, uma conexão por ciclo. Linhas mistas Nansen/Zerion/CoinStats entram como INLINE, e o provedor vem do próprio cache. | `evidence_ledger.py`, `chain_aware_inputs.py` | `test_evidence_ledger_v2.py`, `test_final_stage.py` |
+| 9 | Deduplicação por `chain:address` também no merge multichain e no pré-Dune. | `evm_radar.py`, `selective_alpha.py` | `test_final_stage.py` |
+| 10 | Regra de rede única (`infer_chain`) para `/status`, `/wallets_bs` e alertas. | `evidence_ledger.py`, `telegram_auth.py`, `telegram_notifier.py` | `test_telegram_security.py` |
+| 11 | Fallback do QuickNode só para erro definitivo de método (não para 429, timeout ou 5xx). Crédito por método. Teto diário persistente por provedor na varredura Robinhood e na Alchemy. | `quicknode_solana.py`, `rpc_budget.py`, `robinhood_chainstack.py`, `evm_radar.py` | `test_cost_and_config.py` |
+| 12 | Sem monkeypatch na importação: `robinhood_stream_v2` e `quicknode_solana_compat` são só reexportação, e `telegram_status_patch` e `queue.py` foram removidos. | `__init__.py` e módulos citados | `test_stream_hardening.py` |
+| 13 | Thread própria para o stream; fila de execução protegida por lock e escrita atômica; `safe_call` com traceback no log; persistência de estado com log de erro. | `worker_daemon.py`, `execution_queue.py`, `adaptive_queue.py`, `state.py` | `test_cycles_smoke.py` |
+| 14 | Probes de provedores como etapas opcionais; erro devolvido também conta como ERROR; chave `08d` duplicada corrigida (`08e`). | `runner.py` | `test_v6_cycle_wiring.py`, `test_cost_and_config.py` |
+| 15 | Leitura tolerante do ambiente (`env_int`, `env_float`, `env_bool`); configurações centralizadas no `Settings`; padrões unificados do QuickNode; todas as variáveis no `.env.example`. | `config.py`, `.env.example` | `test_cost_and_config.py` |
+| 16 | 39 testes novos e `conftest.py` isolando o diretório de dados. | `tests/` | — |
+| 17 | Removido o workflow `fix-runner-newlines.yml`. | `.github/workflows/` | — |
+| 18 | A simulação não tem mais wallet nem números fixos no código (vêm do ambiente). | `worker_daemon.py` | — |
+| 19 | `pytest` foi para `requirements-dev.txt`. | `requirements*.txt`, `tests.yml` | — |
+| 20 | Bootstrap recusa ZIP cujo tamanho descompactado declarado passe do limite. | `bootstrap.py` | `test_cost_and_config.py` |
+| 21 | Imports não usados e avisos do ruff corrigidos. | — | — |
+
+Os scripts em `analise/` rodam nas duas versões. Saída no código corrigido:
+
+| Caso | Original | Corrigido |
+|---|---|---|
+| ROI do Nansen saindo do adaptador | `12.5` | `0.125` |
+| Win rate de 55 (em %) | `PASS` | `REJECT_WR` |
+| Win rate canônico (Nansen antigo × Birdeye recente) | `0.9` | `0.3` |
+| Linhas no ledger após 3 ciclos iguais | 9 | 3 |
+| 429 no `eth_getCode` | cacheado como contrato | `errors=1`, nada cacheado |
+| Espera do webhook pelo lock | 2,8 s | 0,0 s |
+
+**O que continua pendente:**
+- Unidade do ROI do Birdeye: ficou pelo nome do campo, porque a documentação pública não confirma o schema. Se `realized_roi` vier em %, mude em `birdeye_alpha._parse_pnl`.
+- Os tetos diários padrão (50k chamadas/dia por provedor) são uma trava contra loops descontrolados. Ajuste ao seu plano.
+- O estado do stream continua num JSON (agora compacto). Com volume alto, o próximo passo é SQLite.

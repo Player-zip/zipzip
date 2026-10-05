@@ -6,7 +6,7 @@ import time
 
 import pandas as pd
 
-from .nansen_evm import _atomic_json, _fetch_wallet, _load_json
+from .nansen_evm import _atomic_json, _fetch_wallet, _load_json, upgrade_cached_metrics
 from .zerion_evm import fetch_zerion_wallet_pnl
 
 
@@ -180,6 +180,8 @@ def enrich_legacy_robinhood_rotating(
             metrics = cached.get("metrics") if isinstance(cached.get("metrics"), dict) else None
             if not metrics:
                 continue
+            if provider == "nansen":
+                metrics = upgrade_cached_metrics(metrics)
             had = _has_performance_evidence(row)
             _fill_missing(row, metrics)
             if not had and _has_performance_evidence(row):

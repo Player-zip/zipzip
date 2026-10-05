@@ -18,6 +18,13 @@ for roi in (12.5, 0.125):
     a = alpha_score_v22(r); s = selective_alpha_score(r)
     print(f"  roi={roi:>6}: alpha22_pnl_roi={a['alpha22_pnl_roi']:6.2f} alpha22={a['alpha22_score']:6.2f} selective_alpha={s['selective_alpha_score']:6.2f} tier={s['selective_alpha_tier']}")
 
+try:
+    from peixao.nansen_evm import _normalized_metrics  # caminho real: adaptador -> score
+    m = _normalized_metrics({"win_rate": 0.66, "realized_pnl_percent": 12.5}, [], chain="base")
+    print(f"  via adaptador Nansen (realized_pnl_percent=12.5): realized_roi_30d={m['realized_roi_30d']}")
+except Exception as exc:  # versão original
+    print("  via adaptador Nansen:", type(exc).__name__)
+
 print("== 2) Win rate em % (55 = 55%) no alpha_v22 vs selective")
 r = pd.Series({**base, "win_rate": 55.0, "gmgn_winrate_30d": 55.0, "realized_roi_30d": 0.125})
 a = alpha_score_v22(r); s = selective_alpha_score(r)
@@ -28,7 +35,7 @@ db = Path(tempfile.mkdtemp()) / "ev.sqlite3"
 old = "2025-01-01T00:00:00Z"
 record_metrics(db, chain="solana", address="W1", provider="NANSEN", metrics={"win_rate": 0.90}, observed_at=old)
 record_metrics(db, chain="solana", address="W1", provider="BIRDEYE", metrics={"win_rate": 0.30})
-print("  canonical win_rate =", canonical_metrics_for_wallet(db, "solana", "W1")["win_rate"], "(Nansen de 2025-01-01, ignorando Birdeye de hoje)")
+print("  canonical win_rate =", canonical_metrics_for_wallet(db, "solana", "W1")["win_rate"], "(Nansen de 2025-01-01 = 0.9; Birdeye de hoje = 0.3)")
 
 print("== 4) Ledger cresce a cada ciclo quando observed_at muda (updated_at = now)")
 for i in range(3):

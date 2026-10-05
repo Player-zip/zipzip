@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .units import ratio_from_any
+
 
 ALPHA_V22_SCORE_VERSION = "V2.2"
 ALPHA_V22_WEIGHTS = {
@@ -114,7 +116,8 @@ def _component_repeatability(row) -> tuple[float, float] | None:
 
 
 def _component_statistical_edge(row) -> tuple[float, float, dict]:
-    win_rate = _optional_float(row, "gmgn_winrate_30d", "win_rate")
+    # Normaliza em vez de cortar: 55 (pontos percentuais) é 0.55, não 100%.
+    win_rate = ratio_from_any(_optional_float(row, "gmgn_winrate_30d", "win_rate"))
     sample_size, sample_source, sample_quality = _sample_size(row)
     confidence = _sample_confidence(sample_size)
     wilson = wilson_lower_bound(win_rate, sample_size)

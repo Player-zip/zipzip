@@ -285,3 +285,28 @@ def enrich_stage1_with_dune(
         "execution_id": execution_id,
         "output": str(out_path),
     }
+
+
+def load_dune_metrics(state_dir: Path, *, max_age_seconds: int = 7 * 86400) -> dict[str, dict]:
+    """Métricas Dune em cache por wallet Solana, para o construtor final.
+
+    A validação Dune roda no ciclo de 6h; o ciclo horário reaproveita o cache
+    enquanto ele estiver dentro da idade máxima.
+    """
+    cache = _load_json(state_dir / "dune_selectivity_cache.json")
+    entries = cache.get("wallets") if isinstance(cache.get("wallets"), dict) else {}
+    now = int(time.time())
+    out: dict[str, dict] = {}
+    for wallet, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        metrics = entry.get("metrics") if isinstance(entry.get("metrics"), dict) else {}
+        if not metrics:
+            continue
+        if max_age_seconds > 0 and now - int(entry.get("checked_epoch", 0) or 0) > max_age_seconds:
+            continue
+        clean = {k: v for k, v in metrics.items() if str(k).startswith("dune_")}
+        if clean:
+            clean["dune_selectivity_source"] = "dex_solana.trades_30d_tradeflow_proxy"
+            out[str(wallet)] = clean
+    return out

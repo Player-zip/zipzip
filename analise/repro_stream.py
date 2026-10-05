@@ -25,7 +25,7 @@ print("  resultado:", {k: res[k] for k in ("wallets", "errors", "rpc_calls")}, "
 
 print("== B) materialize segura _STATE_LOCK durante chamadas de rede; webhook fica bloqueado")
 import time as _t; _t.sleep = _real_sleep
-w_state = json.loads(state.read_text()); w_state["wallets"][W].pop("eoa_checked_epoch"); state.write_text(json.dumps(w_state))
+w_state = json.loads(state.read_text()); w_state["wallets"][W].pop("eoa_checked_epoch", None); state.write_text(json.dumps(w_state))
 rs._is_eoa_paced = lambda *a, **k: (_t.sleep(3), (True, 1))[1]   # RPC lento (3s)
 th = threading.Thread(target=rs.materialize_stream_candidates, args=(state, out), kwargs=dict(rpc_url="http://rpc", min_cross_token_hits=2))
 th.start(); _t.sleep(0.2)

@@ -11,6 +11,9 @@ import time
 import pandas as pd
 import requests
 
+from .evidence_ledger import normalize_address, normalize_chain, wallet_key
+from .rpc_budget import consume_daily_rpc
+
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
@@ -55,6 +58,8 @@ def _address(value) -> str:
 
 
 def _rpc(url: str, method: str, params: list, timeout: float) -> dict:
+    if not consume_daily_rpc(url):
+        raise RuntimeError("DAILY_RPC_BUDGET_EXHAUSTED")
     response = requests.post(
         url,
         json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
@@ -579,11 +584,15 @@ def merge_multichain_wallet_inputs(
         return {"status": "DONE_EMPTY", "wallets": 0, "by_chain": {}, "output": str(output_path)}
 
     out = pd.concat(frames, ignore_index=True, sort=False)
-    out["address"] = out["address"].astype(str).str.strip()
-    out = out[out["address"].ne("") & out["address"].ne("nan")].copy()
+    out["chain"] = out["chain"].map(normalize_chain)
+    out["address"] = [normalize_address(c, a) for c, a in zip(out["chain"], out["address"], strict=True)]
+    out = out[out["address"].ne("") & out["address"].str.lower().ne("nan")].copy()
+    # Identidade é chain:address: a mesma wallet EVM em Base e Robinhood são
+    # duas linhas, cada uma com a própria evidência.
+    out["wallet_key"] = [wallet_key(c, a) for c, a in zip(out["chain"], out["address"], strict=True)]
     out["_evidence_count"] = out.notna().sum(axis=1)
-    out = out.sort_values(["address", "_evidence_count"], ascending=[True, False], kind="mergesort")
-    out = out.drop_duplicates("address", keep="first").drop(columns=["_evidence_count"]).reset_index(drop=True)
+    out = out.sort_values(["wallet_key", "_evidence_count"], ascending=[True, False], kind="mergesort")
+    out = out.drop_duplicates("wallet_key", keep="first").drop(columns=["_evidence_count"]).reset_index(drop=True)
     out.to_csv(output_path, index=False)
     by_chain = {str(k): int(v) for k, v in out["chain"].fillna("unknown").value_counts().to_dict().items()}
     return {"status": "DONE", "wallets": int(len(out)), "by_chain": by_chain, "output": str(output_path)}

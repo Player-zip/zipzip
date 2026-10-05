@@ -13,6 +13,7 @@ from .evm_radar import (
     _address,
     run_robinhood_radar,
 )
+from .rpc_budget import consume_daily_rpc
 
 
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -52,6 +53,8 @@ def _paced_rpc(
         if wait > 0:
             time.sleep(wait)
 
+        if not consume_daily_rpc(url):
+            raise RpcCallError("DAILY_RPC_BUDGET_EXHAUSTED", status_code=None, attempts=max(1, attempts))
         attempts += 1
         pacing_state["last_request"] = time.monotonic()
         try:
@@ -202,7 +205,11 @@ def _is_eoa_paced(
     *,
     pacing_state: dict,
     min_interval: float,
-) -> tuple[bool, int]:
+) -> tuple[bool | None, int]:
+    """True = EOA, False = contrato, None = desconhecido (falha de RPC).
+
+    Falha de RPC nunca pode virar "contrato": quem chama não deve cachear None.
+    """
     try:
         body, used = _paced_rpc(
             rpc_url,
@@ -215,7 +222,7 @@ def _is_eoa_paced(
         code = str(body.get("result") or "").lower()
         return code in {"", "0x", "0x0", "0x00"}, used
     except RpcCallError as exc:
-        return False, max(1, int(getattr(exc, "attempts", 1)))
+        return None, max(1, int(getattr(exc, "attempts", 1)))
 
 
 def discover_wallets_from_tokens_rpc(

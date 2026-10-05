@@ -4,14 +4,15 @@ import base64
 from datetime import datetime, timezone
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import gzip
 import hmac
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import threading
 import time
+import zlib
 
 import pandas as pd
 import requests
@@ -23,9 +24,17 @@ from .robinhood_chainstack import ROBINHOOD_CHAIN_ID, _is_eoa_paced
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 STREAM_API_BASE = "https://api.quicknode.com/streams/rest/v1/streams"
 STREAM_NETWORK = "robinhood-mainnet"
-STREAM_DATASET = "logs"
+# QuickNode REST usa o enum block_with_receipts para Streams da Robinhood Chain.
+STREAM_DATASET = "block_with_receipts"
 STREAM_WEBHOOK_PATH = "/quicknode/robinhood-stream"
+# Limites do webhook público: corpo bruto e corpo descompactado.
+DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024
+DEFAULT_MAX_DECOMPRESSED_BYTES = 25 * 1024 * 1024
+# Protege o JSON de estado: leitura/escrita rápidas, sem rede dentro do lock.
 _STATE_LOCK = threading.RLock()
+# Serializa materializações (thread do stream x ciclo de discovery).
+_MATERIALIZE_LOCK = threading.Lock()
+logger = logging.getLogger("peixao.stream")
 
 
 def _now_iso() -> str:
@@ -42,8 +51,9 @@ def _load_json(path: Path) -> dict:
 
 def _atomic_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
+    # JSON compacto: o estado é regravado a cada entrega do webhook.
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -227,27 +237,48 @@ def ingest_stream_payload(
 
 
 def _filter_code(tokens: list[str]) -> str:
-    watch = json.dumps(sorted(set(_normalize_evm_address(x) for x in tokens if _normalize_evm_address(x))))
+    normalized = sorted(set(x for x in (_normalize_evm_address(t) for t in tokens) if x))
+    watch = json.dumps(normalized)
     return f'''function main(stream) {{
   const WATCH = new Set({watch});
   const TRANSFER = "{TRANSFER_TOPIC}";
   const rows = Array.isArray(stream.data) ? stream.data : (stream.data ? [stream.data] : []);
   const events = [];
-  for (const log of rows) {{
-    if (!log || !Array.isArray(log.topics) || log.topics.length < 3) continue;
-    const topic0 = String(log.topics[0] || "").toLowerCase();
-    const token = String(log.address || "").toLowerCase();
-    if (topic0 !== TRANSFER || !WATCH.has(token)) continue;
-    const from = "0x" + String(log.topics[1] || "").replace(/^0x/, "").slice(-40).toLowerCase();
-    const to = "0x" + String(log.topics[2] || "").replace(/^0x/, "").slice(-40).toLowerCase();
-    events.push({{
-      token, from, to,
-      block_number: log.blockNumber,
-      transaction_hash: log.transactionHash,
-      log_index: log.logIndex,
-      removed: Boolean(log.removed)
-    }});
+
+  for (const row of rows) {{
+    if (!row || typeof row !== "object") continue;
+    const block = row.block && typeof row.block === "object" ? row.block : row;
+    const receipts = Array.isArray(row.receipts)
+      ? row.receipts
+      : (Array.isArray(block.receipts) ? block.receipts : []);
+    const blockNumber = block.number || row.blockNumber || row.block_number || null;
+
+    for (const receipt of receipts) {{
+      if (!receipt || typeof receipt !== "object") continue;
+      const logs = Array.isArray(receipt.logs) ? receipt.logs : [];
+      const receiptTxHash = receipt.transactionHash || receipt.transaction_hash || null;
+
+      for (const log of logs) {{
+        if (!log || !Array.isArray(log.topics) || log.topics.length < 3) continue;
+        const topic0 = String(log.topics[0] || "").toLowerCase();
+        const token = String(log.address || "").toLowerCase();
+        if (topic0 !== TRANSFER || !WATCH.has(token)) continue;
+
+        const from = "0x" + String(log.topics[1] || "").replace(/^0x/, "").slice(-40).toLowerCase();
+        const to = "0x" + String(log.topics[2] || "").replace(/^0x/, "").slice(-40).toLowerCase();
+        events.push({{
+          token,
+          from,
+          to,
+          block_number: log.blockNumber || blockNumber,
+          transaction_hash: log.transactionHash || receiptTxHash,
+          log_index: log.logIndex,
+          removed: Boolean(log.removed)
+        }});
+      }}
+    }}
   }}
+
   if (!events.length) return null;
   return {{events, metadata: stream.metadata}};
 }}'''
@@ -256,6 +287,19 @@ def _filter_code(tokens: list[str]) -> str:
 def _encoded_filter(tokens: list[str]) -> tuple[str, str]:
     code = _filter_code(tokens)
     return base64.b64encode(code.encode("utf-8")).decode("ascii"), sha256(code.encode("utf-8")).hexdigest()
+
+
+def _safe_api_error(body: dict) -> str | None:
+    for key in ("error", "message", "detail", "errors"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:600]
+        if isinstance(value, (list, dict)):
+            try:
+                return json.dumps(value, ensure_ascii=False)[:600]
+            except Exception:
+                pass
+    return None
 
 
 def _stream_api(
@@ -284,6 +328,22 @@ def _stream_api(
     return int(response.status_code), body if isinstance(body, dict) else {}
 
 
+def _stream_create_options(batch_size: int) -> dict:
+    """Opções de criação compatíveis com o plano gratuito do Streams.
+
+    O plano gratuito não aceita reorg em tempo real, distância da ponta nem
+    lotes acima de 1 bloco; a reconciliação RPC de 6h cobre o drift raro de
+    reorg. Planos pagos podem sobrescrever pelas variáveis de ambiente.
+    """
+    from .config import env_int
+
+    return {
+        "dataset_batch_size": max(1, int(batch_size)),
+        "fix_block_reorgs": env_int("PEIXAO_ROBINHOOD_STREAM_FIX_REORGS", 0),
+        "keep_distance_from_tip": env_int("PEIXAO_ROBINHOOD_STREAM_TIP_DISTANCE", 0),
+    }
+
+
 def _resolve_webhook_url(explicit: str | None = None) -> str:
     value = str(explicit or "").strip()
     if value:
@@ -303,7 +363,7 @@ def sync_robinhood_stream(
     api_key: str | None,
     webhook_url: str | None = None,
     timeout: float = 15.0,
-    batch_size: int = 20,
+    batch_size: int = 1,
 ) -> dict:
     try:
         shortlist = pd.read_csv(shortlist_path) if shortlist_path.is_file() else pd.DataFrame()
@@ -342,7 +402,7 @@ def sync_robinhood_stream(
             "network": STREAM_NETWORK,
             "dataset": STREAM_DATASET,
             "region": "usa_east",
-            "dataset_batch_size": max(5, int(batch_size)),
+            **_stream_create_options(batch_size),
             "elastic_batch_enabled": True,
             "destination": "webhook",
             "destination_attributes": {
@@ -353,14 +413,12 @@ def sync_robinhood_stream(
                 "post_timeout_sec": 10,
             },
             "filter_function": encoded,
-            "fix_block_reorgs": 1,
-            "keep_distance_from_tip": 2,
             "status": "paused",
         }
         status, body = _stream_api("POST", "", api_key=key, payload=create_payload, timeout=timeout)
         http_calls += 1
         if status not in {200, 201} or not body.get("id"):
-            return {"status": "CREATE_ERROR", "http_status": status, "http_calls": http_calls, "tokens": len(tokens), "stream_active": False}
+            return {"status": "CREATE_ERROR", "http_status": status, "http_calls": http_calls, "tokens": len(tokens), "stream_active": False, "api_error": _safe_api_error(body)}
         stream_id = str(body["id"])
         security_token = str((body.get("destination_attributes") or {}).get("security_token") or "")
         with _STATE_LOCK:
@@ -381,7 +439,7 @@ def sync_robinhood_stream(
     status, current = _stream_api("GET", f"/{stream_id}", api_key=key, timeout=timeout)
     http_calls += 1
     if status != 200:
-        return {"status": "GET_ERROR", "http_status": status, "http_calls": http_calls, "tokens": len(tokens), "stream_id": stream_id, "stream_active": False}
+        return {"status": "GET_ERROR", "http_status": status, "http_calls": http_calls, "tokens": len(tokens), "stream_id": stream_id, "stream_active": False, "api_error": _safe_api_error(current)}
 
     destination = current.get("destination_attributes") if isinstance(current.get("destination_attributes"), dict) else {}
     security_token = str(destination.get("security_token") or state.get("security_token") or "")
@@ -402,7 +460,7 @@ def sync_robinhood_stream(
         patch_status, patched = _stream_api("PATCH", f"/{stream_id}", api_key=key, payload=patch, timeout=timeout)
         http_calls += 1
         if patch_status != 200:
-            return {"status": "PATCH_ERROR", "http_status": patch_status, "http_calls": http_calls, "tokens": len(tokens), "stream_id": stream_id, "stream_active": False}
+            return {"status": "PATCH_ERROR", "http_status": patch_status, "http_calls": http_calls, "tokens": len(tokens), "stream_id": stream_id, "stream_active": False, "api_error": _safe_api_error(patched)}
         current = patched or current
 
     with _STATE_LOCK:
@@ -434,6 +492,10 @@ def sync_robinhood_stream(
 def stream_needs_materialization(state_path: Path) -> bool:
     with _STATE_LOCK:
         state = _load_json(state_path)
+    # Contador de entregas (não o segundo da entrega): duas entregas no mesmo
+    # segundo, uma antes e outra depois da materialização, não se confundem.
+    if "last_materialized_delivery_count" in state:
+        return int(state.get("delivery_count", 0) or 0) > int(state.get("last_materialized_delivery_count", 0) or 0)
     return int(state.get("last_delivery_epoch", 0) or 0) > int(state.get("last_materialized_delivery_epoch", 0) or 0)
 
 
@@ -450,13 +512,28 @@ def materialize_stream_candidates(
     wallet_ttl_seconds: int = 7 * 86400,
     eoa_ttl_seconds: int = 86400,
 ) -> dict:
-    now = int(time.time())
-    now_iso = _now_iso()
-    with _STATE_LOCK:
-        state = _load_json(state_path)
-        wallets = state.get("wallets") if isinstance(state.get("wallets"), dict) else {}
+    """Transforma o estado do stream em candidatas EOA.
+
+    Três fases para que o webhook nunca espere por rede: (1) fotografa o estado
+    sob o lock; (2) faz as checagens eth_getCode sem lock; (3) reabre o estado
+    atual sob o lock e aplica só os resultados. Falha de RPC fica "desconhecida"
+    e é tentada de novo no próximo ciclo, nunca cacheada como contrato.
+    """
+    with _MATERIALIZE_LOCK:
+        now = int(time.time())
+        now_iso = _now_iso()
         cutoff = now - max(3600, int(wallet_ttl_seconds))
-        wallets = {w: item for w, item in wallets.items() if isinstance(item, dict) and int(item.get("last_seen_epoch", 0) or 0) >= cutoff}
+
+        # (1) fotografia
+        with _STATE_LOCK:
+            state = _load_json(state_path)
+            snapshot_delivery = int(state.get("last_delivery_epoch", 0) or 0)
+            snapshot_count = int(state.get("delivery_count", 0) or 0)
+            raw_wallets = state.get("wallets") if isinstance(state.get("wallets"), dict) else {}
+            wallets = {
+                w: dict(item) for w, item in raw_wallets.items()
+                if isinstance(item, dict) and int(item.get("last_seen_epoch", 0) or 0) >= cutoff
+            }
 
         ranked: list[tuple[str, int, int]] = []
         for wallet, item in wallets.items():
@@ -468,29 +545,34 @@ def materialize_stream_candidates(
         ranked.sort(key=lambda x: (x[1], x[2]), reverse=True)
         ranked = ranked[: max(1, int(max_wallets)) * 3]
 
+        # (2) checagens de rede, fora do lock
         pacing = {"last_request": 0.0}
         min_interval = 1.0 / max(1.0, float(max_rps))
         rpc = str(rpc_url or "").strip()
-        checks = rpc_calls = errors = 0
+        checks = rpc_calls = errors = pending = 0
+        checked: dict[str, bool] = {}
         rows: list[dict] = []
         for wallet, hits, events in ranked:
             if len(rows) >= max(0, int(max_wallets)):
                 break
-            item = wallets.get(wallet) if isinstance(wallets.get(wallet), dict) else {}
+            item = wallets[wallet]
             checked_epoch = int(item.get("eoa_checked_epoch", 0) or 0)
             is_eoa = item.get("is_eoa") if now - checked_epoch < max(0, int(eoa_ttl_seconds)) else None
-            if is_eoa is None and rpc and checks < max(0, int(eoa_checks_per_cycle)):
+            if is_eoa is None:
+                if not rpc or checks >= max(0, int(eoa_checks_per_cycle)):
+                    pending += 1
+                    continue
                 checks += 1
                 try:
                     is_eoa, used = _is_eoa_paced(rpc, wallet, timeout, pacing_state=pacing, min_interval=min_interval)
                     rpc_calls += int(used)
-                    item["is_eoa"] = bool(is_eoa)
-                    item["eoa_checked_epoch"] = now
-                    item["eoa_checked_at"] = now_iso
-                    wallets[wallet] = item
                 except Exception:
-                    errors += 1
+                    logger.exception("checagem de EOA falhou para %s", wallet)
                     is_eoa = None
+                if is_eoa is None:
+                    errors += 1
+                    continue
+                checked[wallet] = bool(is_eoa)
             if is_eoa is not True:
                 continue
             rows.append({
@@ -507,24 +589,48 @@ def materialize_stream_candidates(
                 "stream_last_seen_at": item.get("last_seen_at"),
             })
 
-        state["wallets"] = wallets
-        state["last_materialized_delivery_epoch"] = int(state.get("last_delivery_epoch", 0) or 0)
-        state["last_materialized_at"] = now_iso
-        _atomic_json(state_path, state)
+        # (3) aplica no estado atual (o webhook pode ter escrito no meio tempo)
+        with _STATE_LOCK:
+            state = _load_json(state_path)
+            current = state.get("wallets") if isinstance(state.get("wallets"), dict) else {}
+            current = {
+                w: item for w, item in current.items()
+                if isinstance(item, dict) and int(item.get("last_seen_epoch", 0) or 0) >= cutoff
+            }
+            for wallet, value in checked.items():
+                if isinstance(current.get(wallet), dict):
+                    current[wallet] = {
+                        **current[wallet],
+                        "is_eoa": value,
+                        "eoa_checked_epoch": now,
+                        "eoa_checked_at": now_iso,
+                    }
+            state["wallets"] = current
+            # Entregas que chegaram durante as checagens disparam outra rodada.
+            state["last_materialized_delivery_epoch"] = snapshot_delivery
+            state["last_materialized_delivery_count"] = snapshot_count
+            state["last_materialized_at"] = now_iso
+            _atomic_json(state_path, state)
+            tracked = len(current)
 
-    frame = pd.DataFrame(rows)
-    if not frame.empty:
-        frame = frame.sort_values(
-            ["independent_cross_token_hits", "total_transfer_events", "discovery_score"],
-            ascending=[False, False, False], kind="mergesort",
-        ).reset_index(drop=True)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(output_path, index=False)
+        frame = pd.DataFrame(rows)
+        if not frame.empty:
+            frame = frame.sort_values(
+                ["independent_cross_token_hits", "total_transfer_events", "discovery_score"],
+                ascending=[False, False, False], kind="mergesort",
+            ).reset_index(drop=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+        frame.to_csv(tmp, index=False)
+        os.replace(tmp, output_path)
+    if not rpc and pending:
+        logger.warning("stream: %s wallets aguardando checagem de EOA, mas nenhum RPC configurado", pending)
     return {
-        "status": "DONE",
+        "status": "DONE" if rpc or not pending else "RPC_URL_MISSING",
         "wallets": int(len(frame)),
-        "tracked": int(len(wallets)),
+        "tracked": int(tracked),
         "eoa_checks": int(checks),
+        "eoa_pending": int(pending),
         "rpc_calls": int(rpc_calls),
         "errors": int(errors),
         "output": str(output_path),
@@ -537,6 +643,12 @@ def mark_rpc_backfill(state_path: Path) -> None:
         state["last_rpc_backfill_epoch"] = int(time.time())
         state["last_rpc_backfill_at"] = _now_iso()
         _atomic_json(state_path, state)
+
+
+def _stream_batch_size() -> int:
+    from .config import env_int
+
+    return env_int("PEIXAO_ROBINHOOD_STREAM_BATCH_SIZE", 1)
 
 
 def run_robinhood_stream_cycle(
@@ -577,7 +689,7 @@ def run_robinhood_stream_cycle(
         api_key=api_key,
         webhook_url=webhook_url,
         timeout=timeout,
-        batch_size=int(os.getenv("PEIXAO_ROBINHOOD_STREAM_BATCH_SIZE", "20")),
+        batch_size=_stream_batch_size(),
     )
     candidates = materialize_stream_candidates(
         state_path,
@@ -608,6 +720,46 @@ def run_robinhood_stream_cycle(
     }
 
 
+class PayloadTooLarge(ValueError):
+    pass
+
+
+def _bounded_gunzip(raw: bytes, limit: int) -> bytes:
+    """Descompacta gzip parando no limite (proteção contra gzip bomb)."""
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = decompressor.decompress(raw, limit + 1)
+    if len(out) > limit or decompressor.unconsumed_tail:
+        raise PayloadTooLarge("decompressed body too large")
+    out += decompressor.flush(limit + 1 - len(out))
+    if len(out) > limit:
+        raise PayloadTooLarge("decompressed body too large")
+    return out
+
+
+class _NonceCache:
+    """Entregas já aceitas (nonce + timestamp) dentro da janela da assinatura.
+
+    Um replay de uma requisição assinada válida é respondido como duplicado sem
+    reprocessar. Retries legítimos do QuickNode recebem o mesmo tratamento,
+    o que é idempotente.
+    """
+
+    def __init__(self, window_seconds: int) -> None:
+        self.window = max(60, int(window_seconds)) * 2
+        self._seen: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def seen_before(self, key: str) -> bool:
+        now = time.time()
+        with self._lock:
+            if len(self._seen) > 10_000:
+                self._seen = {k: t for k, t in self._seen.items() if now - t <= self.window}
+            if key in self._seen and now - self._seen[key] <= self.window:
+                return True
+            self._seen[key] = now
+            return False
+
+
 def serve_stream_receiver(
     state_path: Path,
     *,
@@ -615,8 +767,35 @@ def serve_stream_receiver(
     port: int = 8080,
     security_token: str | None = None,
     signature_max_age_seconds: int = 600,
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    max_decompressed_bytes: int = DEFAULT_MAX_DECOMPRESSED_BYTES,
 ) -> None:
+    server = build_stream_server(
+        state_path,
+        host=host,
+        port=port,
+        security_token=security_token,
+        signature_max_age_seconds=signature_max_age_seconds,
+        max_body_bytes=max_body_bytes,
+        max_decompressed_bytes=max_decompressed_bytes,
+    )
+    server.serve_forever(poll_interval=0.5)
+
+
+def build_stream_server(
+    state_path: Path,
+    *,
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    security_token: str | None = None,
+    signature_max_age_seconds: int = 600,
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    max_decompressed_bytes: int = DEFAULT_MAX_DECOMPRESSED_BYTES,
+) -> ThreadingHTTPServer:
     state_path.parent.mkdir(parents=True, exist_ok=True)
+    nonces = _NonceCache(signature_max_age_seconds)
+    body_limit = max(1024, int(max_body_bytes))
+    decompressed_limit = max(body_limit, int(max_decompressed_bytes))
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "RaulluxStream/1.0"
@@ -640,10 +819,28 @@ def serve_stream_receiver(
                 self._reply(404, {"status": "not_found"})
                 return
             try:
-                length = max(0, int(self.headers.get("Content-Length", "0") or 0))
+                length_header = self.headers.get("Content-Length")
+                try:
+                    length = int(length_header)
+                except (TypeError, ValueError):
+                    self.close_connection = True
+                    self._reply(411, {"status": "LENGTH_REQUIRED"})
+                    return
+                if length < 0 or length > body_limit:
+                    # Não lê o corpo: fecha a conexão.
+                    self.close_connection = True
+                    self._reply(413, {"status": "PAYLOAD_TOO_LARGE"})
+                    return
                 raw = self.rfile.read(length)
                 if str(self.headers.get("Content-Encoding", "")).lower() == "gzip":
-                    raw = gzip.decompress(raw)
+                    try:
+                        raw = _bounded_gunzip(raw, decompressed_limit)
+                    except PayloadTooLarge:
+                        self._reply(413, {"status": "PAYLOAD_TOO_LARGE"})
+                        return
+                    except zlib.error:
+                        self._reply(400, {"status": "INVALID_GZIP"})
+                        return
                 body_text = raw.decode("utf-8")
                 with _STATE_LOCK:
                     state = _load_json(state_path)
@@ -657,6 +854,12 @@ def serve_stream_receiver(
                 if not valid:
                     self._reply(401 if reason != "SECURITY_TOKEN_MISSING" else 503, {"status": reason})
                     return
+                nonce_key = "{}:{}".format(
+                    self.headers.get("X-QN-Nonce") or "", self.headers.get("X-QN-Timestamp") or "",
+                )
+                if nonces.seen_before(nonce_key):
+                    self._reply(200, {"status": "DUPLICATE_DELIVERY"})
+                    return
                 payload = json.loads(body_text)
                 if not isinstance(payload, dict):
                     self._reply(400, {"status": "INVALID_PAYLOAD"})
@@ -664,6 +867,7 @@ def serve_stream_receiver(
                 result = ingest_stream_payload(payload, state_path)
                 self._reply(200, result)
             except Exception as exc:
+                logger.exception("falha no webhook do stream")
                 self._reply(500, {"status": "ERROR", "error": type(exc).__name__})
 
         def log_message(self, format, *args):  # noqa: A003
@@ -671,4 +875,4 @@ def serve_stream_receiver(
 
     server = ThreadingHTTPServer((host, int(port)), Handler)
     server.daemon_threads = True
-    server.serve_forever(poll_interval=0.5)
+    return server

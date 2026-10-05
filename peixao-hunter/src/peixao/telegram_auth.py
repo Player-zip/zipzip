@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import functools
 import hashlib
+import hmac
 import json
+import logging
 import sqlite3
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 import pandas as pd
+
+from .evidence_ledger import infer_chain
+from .status_v23 import enhance_status_text
+
+logger = logging.getLogger("peixao.telegram")
 
 
 def _api(token, method, params=None, timeout=10.0):
@@ -67,10 +76,16 @@ def _send_chunks(token, chat_id, text, timeout, max_chars=3500):
     return results
 
 
-def _db(path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+_AUTH_COLUMNS = {
+    "failed_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "locked_until": "INTEGER NOT NULL DEFAULT 0",
+    "password_fp": "TEXT",
+    "authorized_epoch": "INTEGER",
+}
 
+
+def ensure_auth_schema(conn: sqlite3.Connection) -> None:
+    """Cria/migra as tabelas de login (também usada pelo notificador)."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS telegram_auth (
@@ -81,7 +96,10 @@ def _db(path):
         )
         """
     )
-
+    existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(telegram_auth)").fetchall()}
+    for column, ddl in _AUTH_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE telegram_auth ADD COLUMN {column} {ddl}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS telegram_auth_state (
@@ -90,9 +108,65 @@ def _db(path):
         )
         """
     )
-
     conn.commit()
+
+
+def _db(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # O mesmo SQLite é escrito pelo pipeline; espera o lock em vez de falhar.
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    ensure_auth_schema(conn)
     return conn
+
+
+@functools.lru_cache(maxsize=8)
+def password_fingerprint(password: str) -> str:
+    """Impressão da senha vigente, gravada junto da autorização.
+
+    Trocar TELEGRAM_ACCESS_PASSWORD muda a impressão e revoga todas as sessões.
+    PBKDF2 para que o valor no banco não sirva de atalho para descobrir a senha.
+    """
+    digest = hashlib.pbkdf2_hmac("sha256", str(password).encode("utf-8"), b"peixao-telegram-auth-v1", 200_000)
+    return digest.hex()[:32]
+
+
+def _password_matches(candidate: str, password: str) -> bool:
+    return hmac.compare_digest(
+        hashlib.sha256(candidate.encode("utf-8")).digest(),
+        hashlib.sha256(password.encode("utf-8")).digest(),
+    )
+
+
+def _auth_valid(row, fingerprint: str | None, ttl_days: float, now: int) -> bool:
+    """row = (authorized, password_fp, authorized_epoch)."""
+    if not row or not row[0]:
+        return False
+    if fingerprint is not None and row[1] != fingerprint:
+        return False
+    if ttl_days and ttl_days > 0:
+        authorized_epoch = int(row[2] or 0)
+        if now - authorized_epoch > float(ttl_days) * 86400:
+            return False
+    return True
+
+
+def authorized_chat_ids(
+    conn: sqlite3.Connection,
+    access_password: str | None = None,
+    *,
+    ttl_days: float = 0,
+    now: int | None = None,
+) -> list[str]:
+    """Chats com sessão válida: autorizados, com a senha vigente e dentro da validade."""
+    ensure_auth_schema(conn)
+    now = int(time.time()) if now is None else int(now)
+    fingerprint = password_fingerprint(access_password) if access_password else None
+    rows = conn.execute(
+        "SELECT chat_id, authorized, password_fp, authorized_epoch FROM telegram_auth WHERE authorized=1"
+    ).fetchall()
+    return [str(r[0]) for r in rows if _auth_valid(r[1:], fingerprint, ttl_days, now)]
 
 
 def _read_csv(path: Path):
@@ -115,25 +189,8 @@ def _score_column(frame: pd.DataFrame) -> str | None:
 def _stage_chain_labels(stage: pd.DataFrame) -> pd.Series:
     if stage.empty:
         return pd.Series(dtype=str)
-
-    labels = pd.Series("", index=stage.index, dtype="object")
-
-    if "chain" in stage.columns:
-        raw = stage["chain"].fillna("").astype(str).str.strip().str.lower()
-        labels = raw.where(~raw.isin(["", "nan", "none"]), "")
-
-    if "selective_input_source" in stage.columns:
-        legacy = (
-            stage["selective_input_source"]
-            .fillna("")
-            .astype(str)
-            .str.lower()
-            .eq("legacy_v6")
-        )
-        labels = labels.mask(labels.eq("") & legacy, "robinhood")
-
-    labels = labels.mask(labels.eq(""), "solana")
-    return labels
+    # Mesma regra usada nos alertas (evidence_ledger.infer_chain).
+    return pd.Series([infer_chain(row) for row in stage.to_dict("records")], index=stage.index, dtype="object")
 
 
 def _alpha_mask(stage: pd.DataFrame, scores: pd.Series) -> pd.Series:
@@ -201,6 +258,10 @@ def _completed_stage(data_dir: Path) -> pd.DataFrame:
 
 
 def _status_text(data_dir: Path) -> str:
+    return enhance_status_text(_base_status_text(data_dir), data_dir)
+
+
+def _base_status_text(data_dir: Path) -> str:
     output = data_dir / "output"
     state_path = data_dir / "state" / "pipeline_state.json"
 
@@ -417,12 +478,167 @@ def _blocked_text() -> str:
     return "🔒 Acesso bloqueado.\nEnvie /start para autenticar."
 
 
+_AUTHORIZED_HELP = (
+    "Use /status para acompanhar o radar.\n"
+    "Use /wallets_bs para listar wallets B–S.\n"
+    "Use /logout para encerrar a sessão."
+)
+
+
+def _locked_text(seconds_left: int) -> str:
+    minutes = max(1, int(round(seconds_left / 60.0)))
+    return f"🔒 Muitas tentativas erradas. Tente novamente em {minutes} min."
+
+
+def _delete_message(token, chat_id, message_id, timeout) -> None:
+    # A senha não deve ficar no histórico do chat. Bots podem apagar mensagens
+    # recebidas em chats privados; falha aqui não bloqueia o login.
+    if message_id is None:
+        return
+    _api(token, "deleteMessage", {"chat_id": str(chat_id), "message_id": str(message_id)}, timeout)
+
+
+def _save_offset(conn, offset: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO telegram_auth_state(key, value)
+        VALUES('offset', ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value=excluded.value
+        """,
+        (str(offset),),
+    )
+    conn.commit()
+
+
+def _handle_message(
+    conn,
+    *,
+    token,
+    access_password: str,
+    fingerprint: str,
+    chat_id: str,
+    text: str,
+    message_id,
+    db_path: Path,
+    timeout: float,
+    max_attempts: int,
+    lockout_seconds: int,
+    auth_ttl_days: float,
+    now: int,
+) -> str:
+    """Trata uma mensagem e devolve o desfecho (para contagem)."""
+    row = conn.execute(
+        """
+        SELECT authorized, password_fp, authorized_epoch, awaiting_password,
+               failed_attempts, locked_until
+        FROM telegram_auth WHERE chat_id=?
+        """,
+        (chat_id,),
+    ).fetchone()
+    is_auth = _auth_valid(row[:3] if row else None, fingerprint, auth_ttl_days, now)
+    awaiting = bool(row and row[3])
+    failed = int(row[4] or 0) if row else 0
+    locked_until = int(row[5] or 0) if row else 0
+    command = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+
+    if command == "/start":
+        if is_auth:
+            _send(token, chat_id, "🐟 Raullux Alpha Bot\n\n✅ Acesso já autorizado.\n\n" + _AUTHORIZED_HELP, timeout)
+            return "noop"
+        conn.execute(
+            """
+            INSERT INTO telegram_auth(chat_id, authorized, awaiting_password)
+            VALUES(?, 0, 1)
+            ON CONFLICT(chat_id)
+            DO UPDATE SET authorized=0, awaiting_password=1
+            """,
+            (chat_id,),
+        )
+        conn.commit()
+        if locked_until > now:
+            _send(token, chat_id, _locked_text(locked_until - now), timeout)
+            return "locked"
+        _send(token, chat_id, "🔐 Raullux Alpha Bot\n\nDigite a senha de acesso.", timeout)
+        return "prompted"
+
+    if command == "/logout":
+        conn.execute(
+            "UPDATE telegram_auth SET authorized=0, awaiting_password=0, password_fp=NULL WHERE chat_id=?",
+            (chat_id,),
+        )
+        conn.commit()
+        _send(token, chat_id, "👋 Sessão encerrada. Envie /start para entrar de novo.", timeout)
+        return "logout"
+
+    if command == "/status":
+        if is_auth:
+            _send_chunks(token, chat_id, _status_text(db_path.parent), timeout)
+            return "noop"
+        _send(token, chat_id, _blocked_text(), timeout)
+        return "blocked"
+
+    if command == "/wallets_bs":
+        if is_auth:
+            _send_chunks(token, chat_id, _wallets_bs_text(db_path.parent), timeout)
+            return "noop"
+        _send(token, chat_id, _blocked_text(), timeout)
+        return "blocked"
+
+    if awaiting and not is_auth and not command:
+        _delete_message(token, chat_id, message_id, timeout)
+        if locked_until > now:
+            _send(token, chat_id, _locked_text(locked_until - now), timeout)
+            return "locked"
+        if _password_matches(text, access_password):
+            conn.execute(
+                """
+                UPDATE telegram_auth
+                SET authorized=1, awaiting_password=0, failed_attempts=0, locked_until=0,
+                    password_fp=?, authorized_epoch=?, authorized_at=CURRENT_TIMESTAMP
+                WHERE chat_id=?
+                """,
+                (fingerprint, now, chat_id),
+            )
+            conn.commit()
+            _send(token, chat_id, "✅ Senha correta. Acesso autorizado ao Raullux Alpha Bot.\n\n" + _AUTHORIZED_HELP, timeout)
+            return "authorized"
+        failed += 1
+        if failed >= max(1, int(max_attempts)):
+            locked_until = now + max(60, int(lockout_seconds))
+            conn.execute(
+                "UPDATE telegram_auth SET failed_attempts=0, locked_until=? WHERE chat_id=?",
+                (locked_until, chat_id),
+            )
+            conn.commit()
+            logger.warning("login do Telegram bloqueado para o chat %s após %s tentativas", chat_id, failed)
+            _send(token, chat_id, _locked_text(locked_until - now), timeout)
+            return "denied"
+        conn.execute("UPDATE telegram_auth SET failed_attempts=? WHERE chat_id=?", (failed, chat_id))
+        conn.commit()
+        _send(
+            token,
+            chat_id,
+            "❌ Senha errada.\n\nPara solicitar acesso, entre em contato com @RaulLux",
+            timeout,
+        )
+        return "denied"
+
+    if not is_auth:
+        _send(token, chat_id, _blocked_text(), timeout)
+        return "blocked"
+    return "noop"
+
+
 def process_auth_updates(
     *,
     token,
     access_password,
     db_path: Path,
     timeout=10.0,
+    max_attempts: int = 5,
+    lockout_seconds: int = 900,
+    auth_ttl_days: float = 0,
 ):
     if not token or not access_password:
         return {
@@ -430,9 +646,22 @@ def process_auth_updates(
             "processed": 0,
         }
 
+    fingerprint = password_fingerprint(access_password)
     conn = _db(db_path)
 
     try:
+        # Sessões criadas antes da impressão de senha ficam presas à senha atual;
+        # a próxima troca de senha as revoga como as demais.
+        conn.execute(
+            """
+            UPDATE telegram_auth
+            SET password_fp=?, authorized_epoch=COALESCE(authorized_epoch, CAST(strftime('%s','now') AS INTEGER))
+            WHERE authorized=1 AND password_fp IS NULL
+            """,
+            (fingerprint,),
+        )
+        conn.commit()
+
         row = conn.execute(
             "SELECT value FROM telegram_auth_state WHERE key='offset'"
         ).fetchone()
@@ -456,160 +685,44 @@ def process_auth_updates(
             }
 
         updates = result.get("result") or []
-        processed = 0
-        authorized = 0
-        denied = 0
+        counts = {"processed": 0, "authorized": 0, "denied": 0, "locked": 0, "errors": 0}
 
         for upd in updates:
             update_id = int(upd.get("update_id", 0))
+            # O offset avança antes do tratamento: uma mensagem que quebra o
+            # handler não é reprocessada a cada 3 s (nem trava o bot).
             offset = max(offset, update_id + 1)
-
-            msg = upd.get("message") or {}
-            chat = msg.get("chat") or {}
-            chat_id = str(chat.get("id", ""))
-            text = str(msg.get("text", "")).strip()
-
-            if not chat_id or not text:
-                continue
-
-            processed += 1
-
-            auth = conn.execute(
-                """
-                SELECT authorized, awaiting_password
-                FROM telegram_auth
-                WHERE chat_id=?
-                """,
-                (chat_id,),
-            ).fetchone()
-
-            is_auth = bool(auth and auth[0])
-            awaiting = bool(auth and auth[1])
-
-            if text.startswith("/"):
-                command = text.split()[0].split("@")[0].lower()
-            else:
-                command = ""
-
-            if command == "/start":
-                if is_auth:
-                    _send(
-                        token,
-                        chat_id,
-                        (
-                            "🐟 Raullux Alpha Bot\n\n"
-                            "✅ Acesso já autorizado.\n\n"
-                            "Use /status para acompanhar o radar.\n"
-                            "Use /wallets_bs para listar wallets B–S."
-                        ),
-                        timeout,
+            try:
+                msg = upd.get("message") or {}
+                chat = msg.get("chat") or {}
+                chat_id = str(chat.get("id", ""))
+                text = str(msg.get("text", "")).strip()
+                if chat_id and text:
+                    counts["processed"] += 1
+                    outcome = _handle_message(
+                        conn,
+                        token=token,
+                        access_password=str(access_password),
+                        fingerprint=fingerprint,
+                        chat_id=chat_id,
+                        text=text,
+                        message_id=msg.get("message_id"),
+                        db_path=db_path,
+                        timeout=timeout,
+                        max_attempts=max_attempts,
+                        lockout_seconds=lockout_seconds,
+                        auth_ttl_days=auth_ttl_days,
+                        now=int(time.time()),
                     )
-                else:
-                    conn.execute(
-                        """
-                        INSERT INTO telegram_auth(
-                            chat_id,
-                            authorized,
-                            awaiting_password
-                        )
-                        VALUES(?, 0, 1)
-                        ON CONFLICT(chat_id)
-                        DO UPDATE SET awaiting_password=1
-                        """,
-                        (chat_id,),
-                    )
-                    conn.commit()
-                    _send(
-                        token,
-                        chat_id,
-                        "🔐 Raullux Alpha Bot\n\nDigite a senha de acesso.",
-                        timeout,
-                    )
+                    if outcome in counts:
+                        counts[outcome] += 1
+            except Exception:
+                counts["errors"] += 1
+                logger.exception("falha ao tratar update %s do Telegram", update_id)
+            finally:
+                _save_offset(conn, offset)
 
-            elif command == "/status":
-                if is_auth:
-                    _send_chunks(
-                        token,
-                        chat_id,
-                        _status_text(db_path.parent),
-                        timeout,
-                    )
-                else:
-                    _send(token, chat_id, _blocked_text(), timeout)
-
-            elif command == "/wallets_bs":
-                if is_auth:
-                    _send_chunks(
-                        token,
-                        chat_id,
-                        _wallets_bs_text(db_path.parent),
-                        timeout,
-                    )
-                else:
-                    _send(token, chat_id, _blocked_text(), timeout)
-
-            elif awaiting and not is_auth:
-                password_ok = (
-                    hashlib.sha256(text.encode()).digest()
-                    == hashlib.sha256(access_password.encode()).digest()
-                )
-
-                if password_ok:
-                    conn.execute(
-                        """
-                        UPDATE telegram_auth
-                        SET
-                            authorized=1,
-                            awaiting_password=0,
-                            authorized_at=CURRENT_TIMESTAMP
-                        WHERE chat_id=?
-                        """,
-                        (chat_id,),
-                    )
-                    conn.commit()
-                    _send(
-                        token,
-                        chat_id,
-                        (
-                            "✅ Senha correta. Acesso autorizado ao Raullux Alpha Bot.\n\n"
-                            "Use /status para acompanhar o radar.\n"
-                            "Use /wallets_bs para listar wallets B–S."
-                        ),
-                        timeout,
-                    )
-                    authorized += 1
-                else:
-                    _send(
-                        token,
-                        chat_id,
-                        (
-                            "❌ Senha errada.\n\n"
-                            "Para solicitar acesso, entre em contato com @RaulLux"
-                        ),
-                        timeout,
-                    )
-                    denied += 1
-
-            elif not is_auth:
-                _send(token, chat_id, _blocked_text(), timeout)
-
-        conn.execute(
-            """
-            INSERT INTO telegram_auth_state(key, value)
-            VALUES('offset', ?)
-            ON CONFLICT(key)
-            DO UPDATE SET value=excluded.value
-            """,
-            (str(offset),),
-        )
-        conn.commit()
-
-        return {
-            "status": "DONE",
-            "processed": processed,
-            "authorized": authorized,
-            "denied": denied,
-        }
+        return {"status": "DONE" if not counts["errors"] else "PARTIAL", **counts}
 
     finally:
         conn.close()

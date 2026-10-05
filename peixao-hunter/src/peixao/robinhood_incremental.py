@@ -390,6 +390,7 @@ def discover_wallets_incremental(
     ranked = ranked[: max(1, int(max_wallets)) * 2]
 
     rows: list[dict] = []
+    eoa_unknown = 0
     for wallet, hits, events in ranked:
         if len(rows) >= max(0, int(max_wallets)):
             break
@@ -405,6 +406,10 @@ def discover_wallets_incremental(
                 min_interval=min_interval,
             )
             calls += used
+            if is_eoa is None:
+                # Falha de RPC: tenta de novo no próximo ciclo, sem cachear.
+                eoa_unknown += 1
+                continue
             item["is_eoa"] = bool(is_eoa)
             item["eoa_checked_epoch"] = now
             item["eoa_checked_at"] = now_iso
@@ -468,6 +473,7 @@ def discover_wallets_incremental(
         "incomplete_tokens": int(incomplete_tokens),
         "truncated_tokens": int(truncated_tokens),
         "rate_limit_errors": int(rate_limit_errors),
+        "eoa_unknown": int(eoa_unknown),
         "provider": provider_label,
         "latest_block": int(latest_block),
         "bootstrap_lookback_blocks": int(bootstrap_lookback_blocks),

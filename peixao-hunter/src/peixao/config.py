@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import logging
 import os
 
 
@@ -17,6 +18,49 @@ def _bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _warn_invalid(name: str, value: str, default) -> None:
+    # Config é carregada no import; um valor inválido não pode derrubar o
+    # pacote inteiro. Avisa e usa o padrão.
+    logging.getLogger("peixao.config").warning(
+        "valor inválido para %s=%r; usando o padrão %r", name, value, default
+    )
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return int(default)
+    try:
+        return int(float(value.strip()))
+    except ValueError:
+        _warn_invalid(name, value, default)
+        return int(default)
+
+
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return float(default)
+    try:
+        return float(value.strip())
+    except ValueError:
+        _warn_invalid(name, value, default)
+        return float(default)
+
+
+def env_int(name: str, default: int) -> int:
+    """Leitura tolerante de inteiros fora do ``Settings`` (mesma regra)."""
+    return _int_env(name, default)
+
+
+def env_float(name: str, default: float) -> float:
+    return _float_env(name, default)
+
+
+def env_bool(name: str, default: bool) -> bool:
+    return _bool_env(name, default)
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path = _path_env("PEIXAO_DATA_DIR", "./data") or Path("./data")
@@ -28,24 +72,24 @@ class Settings:
     log_level: str = os.getenv("PEIXAO_LOG_LEVEL", "INFO")
     start_checkpoint: str = os.getenv("PEIXAO_START_CHECKPOINT", "entry")
     end_checkpoint: str = os.getenv("PEIXAO_END_CHECKPOINT", "p1h")
-    min_tokens: int = int(os.getenv("PEIXAO_MIN_TOKENS", "2"))
-    tx_per_token: int = int(os.getenv("PEIXAO_TX_PER_TOKEN", "40"))
-    max_rpc_tx: int = int(os.getenv("PEIXAO_MAX_RPC_TX", "1200"))
-    rpc_delay: float = float(os.getenv("PEIXAO_RPC_DELAY", "0.08"))
-    rpc_timeout: float = float(os.getenv("PEIXAO_RPC_TIMEOUT", "20"))
-    rpc_retries: int = int(os.getenv("PEIXAO_RPC_RETRIES", "4"))
+    min_tokens: int = _int_env("PEIXAO_MIN_TOKENS", 2)
+    tx_per_token: int = _int_env("PEIXAO_TX_PER_TOKEN", 40)
+    max_rpc_tx: int = _int_env("PEIXAO_MAX_RPC_TX", 1200)
+    rpc_delay: float = _float_env("PEIXAO_RPC_DELAY", 0.08)
+    rpc_timeout: float = _float_env("PEIXAO_RPC_TIMEOUT", 20)
+    rpc_retries: int = _int_env("PEIXAO_RPC_RETRIES", 4)
     run_rpc: bool = _bool_env("PEIXAO_RUN_RPC", True)
     rpc_url: str = os.getenv("PEIXAO_RPC_URL", "https://rpc.mainnet.chain.robinhood.com")
 
     rpc_budget_enabled: bool = _bool_env("PEIXAO_RPC_BUDGET_ENABLED", True)
-    rpc_budget_run_total: int = int(os.getenv("PEIXAO_RPC_BUDGET_RUN", "60"))
-    rpc_budget_hourly_total: int = int(os.getenv("PEIXAO_RPC_BUDGET_HOURLY", "60"))
-    rpc_budget_daily_total: int = int(os.getenv("PEIXAO_RPC_BUDGET_DAILY", "240"))
-    rpc_budget_radar: int = int(os.getenv("PEIXAO_RPC_BUDGET_RADAR", "0"))
-    rpc_budget_tx_origin: int = int(os.getenv("PEIXAO_RPC_BUDGET_TX_ORIGIN", "40"))
-    rpc_budget_classification: int = int(os.getenv("PEIXAO_RPC_BUDGET_CLASSIFICATION", "15"))
-    rpc_budget_wallet_validation: int = int(os.getenv("PEIXAO_RPC_BUDGET_WALLET_VALIDATION", "5"))
-    rpc_budget_deep_dive: int = int(os.getenv("PEIXAO_RPC_BUDGET_DEEP_DIVE", "20"))
+    rpc_budget_run_total: int = _int_env("PEIXAO_RPC_BUDGET_RUN", 60)
+    rpc_budget_hourly_total: int = _int_env("PEIXAO_RPC_BUDGET_HOURLY", 60)
+    rpc_budget_daily_total: int = _int_env("PEIXAO_RPC_BUDGET_DAILY", 240)
+    rpc_budget_radar: int = _int_env("PEIXAO_RPC_BUDGET_RADAR", 0)
+    rpc_budget_tx_origin: int = _int_env("PEIXAO_RPC_BUDGET_TX_ORIGIN", 40)
+    rpc_budget_classification: int = _int_env("PEIXAO_RPC_BUDGET_CLASSIFICATION", 15)
+    rpc_budget_wallet_validation: int = _int_env("PEIXAO_RPC_BUDGET_WALLET_VALIDATION", 5)
+    rpc_budget_deep_dive: int = _int_env("PEIXAO_RPC_BUDGET_DEEP_DIVE", 20)
 
     birdeye_api_key: str | None = os.getenv("BIRDEYE_API_KEY")
     nansen_api_key: str | None = os.getenv("NANSEN_API_KEY")
@@ -66,58 +110,76 @@ class Settings:
     telegram_chat_id: str | None = os.getenv("TELEGRAM_CHAT_ID")
     telegram_alerts_enabled: bool = _bool_env("PEIXAO_TELEGRAM_ALERTS", True)
     telegram_test_once: bool = _bool_env("PEIXAO_TELEGRAM_TEST_ONCE", False)
-    telegram_timeout: float = float(os.getenv("PEIXAO_TELEGRAM_TIMEOUT", "10"))
+    telegram_timeout: float = _float_env("PEIXAO_TELEGRAM_TIMEOUT", 10)
 
     solana_tracker_base_url: str = os.getenv("PEIXAO_SOLANA_TRACKER_BASE_URL", "https://data.solanatracker.io")
     solana_tracker_probe_enabled: bool = _bool_env("PEIXAO_SOLANA_TRACKER_PROBE", True)
-    solana_tracker_probe_ttl_seconds: int = int(os.getenv("PEIXAO_SOLANA_TRACKER_PROBE_TTL", "86400"))
-    solana_tracker_timeout: float = float(os.getenv("PEIXAO_SOLANA_TRACKER_TIMEOUT", "10"))
+    solana_tracker_probe_ttl_seconds: int = _int_env("PEIXAO_SOLANA_TRACKER_PROBE_TTL", 86400)
+    solana_tracker_timeout: float = _float_env("PEIXAO_SOLANA_TRACKER_TIMEOUT", 10)
 
     mobula_base_url: str = os.getenv("PEIXAO_MOBULA_BASE_URL", "https://api.mobula.io/api")
     mobula_probe_enabled: bool = _bool_env("PEIXAO_MOBULA_PROBE", False)
-    mobula_probe_ttl_seconds: int = int(os.getenv("PEIXAO_MOBULA_PROBE_TTL", "86400"))
-    mobula_timeout: float = float(os.getenv("PEIXAO_MOBULA_TIMEOUT", "10"))
+    mobula_probe_ttl_seconds: int = _int_env("PEIXAO_MOBULA_PROBE_TTL", 86400)
+    mobula_timeout: float = _float_env("PEIXAO_MOBULA_TIMEOUT", 10)
 
     jupiter_base_url: str = os.getenv("PEIXAO_JUPITER_BASE_URL", "https://api.jup.ag")
     jupiter_probe_enabled: bool = _bool_env("PEIXAO_JUPITER_PROBE", True)
-    jupiter_probe_ttl_seconds: int = int(os.getenv("PEIXAO_JUPITER_PROBE_TTL", "86400"))
-    jupiter_timeout: float = float(os.getenv("PEIXAO_JUPITER_TIMEOUT", "10"))
+    jupiter_probe_ttl_seconds: int = _int_env("PEIXAO_JUPITER_PROBE_TTL", 86400)
+    jupiter_timeout: float = _float_env("PEIXAO_JUPITER_TIMEOUT", 10)
 
     token_radar_enabled: bool = _bool_env("PEIXAO_TOKEN_RADAR", True)
-    token_radar_ttl_seconds: int = int(os.getenv("PEIXAO_TOKEN_RADAR_TTL", "1800"))
-    token_radar_max_candidates: int = int(os.getenv("PEIXAO_TOKEN_RADAR_MAX_CANDIDATES", "50"))
-    token_radar_max_shortlist: int = int(os.getenv("PEIXAO_TOKEN_RADAR_MAX_SHORTLIST", "5"))
-    token_radar_min_liquidity_usd: float = float(os.getenv("PEIXAO_TOKEN_RADAR_MIN_LIQUIDITY_USD", "25000"))
-    token_radar_min_volume_24h_usd: float = float(os.getenv("PEIXAO_TOKEN_RADAR_MIN_VOLUME_24H_USD", "20000"))
-    token_radar_min_score: float = float(os.getenv("PEIXAO_TOKEN_RADAR_MIN_SCORE", "45"))
+    token_radar_ttl_seconds: int = _int_env("PEIXAO_TOKEN_RADAR_TTL", 1800)
+    token_radar_max_candidates: int = _int_env("PEIXAO_TOKEN_RADAR_MAX_CANDIDATES", 50)
+    token_radar_max_shortlist: int = _int_env("PEIXAO_TOKEN_RADAR_MAX_SHORTLIST", 5)
+    token_radar_min_liquidity_usd: float = _float_env("PEIXAO_TOKEN_RADAR_MIN_LIQUIDITY_USD", 25000)
+    token_radar_min_volume_24h_usd: float = _float_env("PEIXAO_TOKEN_RADAR_MIN_VOLUME_24H_USD", 20000)
+    token_radar_min_score: float = _float_env("PEIXAO_TOKEN_RADAR_MIN_SCORE", 45)
     dexscreener_base_url: str = os.getenv("PEIXAO_DEXSCREENER_BASE_URL", "https://api.dexscreener.com")
 
     birdeye_base_url: str = os.getenv("PEIXAO_BIRDEYE_BASE_URL", "https://public-api.birdeye.so")
     birdeye_alpha_enabled: bool = _bool_env("PEIXAO_BIRDEYE_ALPHA", True)
-    birdeye_alpha_max_tokens: int = int(os.getenv("PEIXAO_BIRDEYE_ALPHA_MAX_TOKENS", "5"))
-    birdeye_top_traders_per_token: int = int(os.getenv("PEIXAO_BIRDEYE_TOP_TRADERS_PER_TOKEN", "30"))
-    birdeye_min_cross_token_hits: int = int(os.getenv("PEIXAO_BIRDEYE_MIN_CROSS_TOKEN_HITS", "2"))
-    birdeye_max_pnl_wallets: int = int(os.getenv("PEIXAO_BIRDEYE_MAX_PNL_WALLETS", "20"))
-    birdeye_top_trader_ttl_seconds: int = int(os.getenv("PEIXAO_BIRDEYE_TOP_TRADER_TTL", "43200"))
-    birdeye_pnl_ttl_seconds: int = int(os.getenv("PEIXAO_BIRDEYE_PNL_TTL", "86400"))
-    birdeye_alpha_delay: float = float(os.getenv("PEIXAO_BIRDEYE_ALPHA_DELAY", "1.05"))
-    birdeye_alpha_timeout: float = float(os.getenv("PEIXAO_BIRDEYE_ALPHA_TIMEOUT", "15"))
+    birdeye_alpha_max_tokens: int = _int_env("PEIXAO_BIRDEYE_ALPHA_MAX_TOKENS", 5)
+    birdeye_top_traders_per_token: int = _int_env("PEIXAO_BIRDEYE_TOP_TRADERS_PER_TOKEN", 30)
+    birdeye_min_cross_token_hits: int = _int_env("PEIXAO_BIRDEYE_MIN_CROSS_TOKEN_HITS", 2)
+    birdeye_max_pnl_wallets: int = _int_env("PEIXAO_BIRDEYE_MAX_PNL_WALLETS", 20)
+    birdeye_top_trader_ttl_seconds: int = _int_env("PEIXAO_BIRDEYE_TOP_TRADER_TTL", 43200)
+    birdeye_pnl_ttl_seconds: int = _int_env("PEIXAO_BIRDEYE_PNL_TTL", 86400)
+    birdeye_alpha_delay: float = _float_env("PEIXAO_BIRDEYE_ALPHA_DELAY", 1.05)
+    birdeye_alpha_timeout: float = _float_env("PEIXAO_BIRDEYE_ALPHA_TIMEOUT", 15)
 
     dune_base_url: str = os.getenv("PEIXAO_DUNE_BASE_URL", "https://api.dune.com")
     dune_probe_enabled: bool = _bool_env("PEIXAO_DUNE_PROBE", True)
-    dune_probe_ttl_seconds: int = int(os.getenv("PEIXAO_DUNE_PROBE_TTL", "86400"))
-    dune_timeout: float = float(os.getenv("PEIXAO_DUNE_TIMEOUT", "10"))
+    dune_probe_ttl_seconds: int = _int_env("PEIXAO_DUNE_PROBE_TTL", 86400)
+    dune_timeout: float = _float_env("PEIXAO_DUNE_TIMEOUT", 10)
     dune_selectivity_enabled: bool = _bool_env("PEIXAO_DUNE_SELECTIVITY", True)
-    dune_selectivity_ttl_seconds: int = int(os.getenv("PEIXAO_DUNE_SELECTIVITY_TTL", "86400"))
-    dune_selectivity_max_wallets: int = int(os.getenv("PEIXAO_DUNE_SELECTIVITY_MAX_WALLETS", "20"))
-    dune_selectivity_lookback_days: int = int(os.getenv("PEIXAO_DUNE_SELECTIVITY_LOOKBACK_DAYS", "30"))
-    dune_selectivity_poll_seconds: float = float(os.getenv("PEIXAO_DUNE_SELECTIVITY_POLL_SECONDS", "60"))
+    dune_selectivity_ttl_seconds: int = _int_env("PEIXAO_DUNE_SELECTIVITY_TTL", 86400)
+    dune_selectivity_max_wallets: int = _int_env("PEIXAO_DUNE_SELECTIVITY_MAX_WALLETS", 20)
+    dune_selectivity_lookback_days: int = _int_env("PEIXAO_DUNE_SELECTIVITY_LOOKBACK_DAYS", 30)
+    dune_selectivity_poll_seconds: float = _float_env("PEIXAO_DUNE_SELECTIVITY_POLL_SECONDS", 60)
+    # Idade máxima do cache Dune aplicado na tabela final (o Dune roda no ciclo de 6h).
+    dune_selectivity_max_age_seconds: int = _int_env("PEIXAO_DUNE_SELECTIVITY_MAX_AGE", 7 * 86400)
+
+    # Ledger de evidências: janela de frescor e retenção do histórico.
+    evidence_max_age_days: float = _float_env("PEIXAO_EVIDENCE_MAX_AGE_DAYS", 30)
+    evidence_retention_days: float = _float_env("PEIXAO_EVIDENCE_RETENTION_DAYS", 120)
+
+    robinhood_rpc_url: str | None = os.getenv("ROBINHOOD_RPC_URL")
+    quicknode_rpc_url: str | None = os.getenv("QUICKNODE_RPC_URL")
+    quicknode_streams_api_key: str | None = os.getenv("QUICKNODE_STREAMS_API_KEY")
+    robinhood_stream_webhook_url: str | None = os.getenv("PEIXAO_ROBINHOOD_STREAM_WEBHOOK_URL")
+    coinstats_api_key: str | None = os.getenv("COINSTATS_API_KEY")
+
+    # Login do bot: tentativas por chat antes do bloqueio, duração do bloqueio
+    # e validade da autorização (0 = não expira; trocar a senha sempre revoga).
+    telegram_auth_max_attempts: int = _int_env("PEIXAO_TELEGRAM_AUTH_MAX_ATTEMPTS", 5)
+    telegram_auth_lockout_seconds: int = _int_env("PEIXAO_TELEGRAM_AUTH_LOCKOUT_SECONDS", 900)
+    telegram_auth_ttl_days: float = _float_env("PEIXAO_TELEGRAM_AUTH_TTL_DAYS", 0)
 
     gmgn_api_key: str | None = os.getenv("GMGN_API_KEY")
     gmgn_live_probe: bool = _bool_env("PEIXAO_GMGN_LIVE_PROBE", True)
     gmgn_demo_enabled: bool = _bool_env("PEIXAO_GMGN_DEMO_ENABLED", True)
     gmgn_chain: str = os.getenv("PEIXAO_GMGN_CHAIN", "robinhood")
-    gmgn_live_timeout: int = int(os.getenv("PEIXAO_GMGN_TIMEOUT", "45"))
+    gmgn_live_timeout: int = _int_env("PEIXAO_GMGN_TIMEOUT", 45)
 
     @property
     def output_dir(self) -> Path:
@@ -130,6 +192,15 @@ class Settings:
     @property
     def cache_dir(self) -> Path:
         return self.data_dir / "cache"
+
+    @property
+    def master_db(self) -> Path:
+        return self.data_dir / "peixao_master.sqlite3"
+
+    @property
+    def robinhood_eoa_rpc_url(self) -> str:
+        """RPC para checagem de EOA do stream: ROBINHOOD_RPC_URL ou o RPC público."""
+        return str(self.robinhood_rpc_url or self.rpc_url or "").strip()
 
     @property
     def rpc_stage_budgets(self) -> dict[str, int]:

@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 
 from .alpha_v22 import alpha_score_v22, wilson_lower_bound
+from .evidence_ledger import infer_chain, normalize_address, wallet_key
+from .units import ratio_from_any
 
 
 SELECTIVE_SCORE_VERSION = "V2.2S1"
@@ -80,17 +82,15 @@ def _frequency_score(entries: float | None) -> float | None:
 
 
 def _accuracy_component(row) -> tuple[float | None, float, dict]:
-    wr = _num(row, "win_rate", "gmgn_winrate_30d")
+    wr = ratio_from_any(_num(row, "win_rate", "gmgn_winrate_30d"))
     wr_source = "birdeye_or_gmgn"
     quality = 1.0
     if wr is None:
-        wr = _num(row, "dune_win_rate_30d")
+        wr = ratio_from_any(_num(row, "dune_win_rate_30d"))
         wr_source = "dune_30d_tradeflow_proxy"
         quality = 0.65
     if wr is None:
         return None, 0.0, {"selective_win_rate": None, "selective_win_rate_source": "missing"}
-    if wr > 1:
-        wr /= 100.0
     n = _num(row, "closed_positions")
     if n is None:
         n = _num(row, "dune_closed_positions_30d")
@@ -262,15 +262,17 @@ def combine_wallet_inputs(legacy_path: Path, radar_path: Path | None = None) -> 
             continue
         frame = frame.copy()
         frame["selective_input_source"] = source
+        frame["chain"] = [infer_chain(row) for row in frame.to_dict("records")]
         frames.append(frame)
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True, sort=False)
-    out["address"] = out["address"].astype(str).str.strip()
-    out = out[out["address"].ne("") & out["address"].ne("nan")].copy()
+    out["address"] = [normalize_address(c, a) for c, a in zip(out["chain"], out["address"], strict=True)]
+    out = out[out["address"].ne("") & out["address"].str.lower().ne("nan")].copy()
+    out["wallet_key"] = [wallet_key(c, a) for c, a in zip(out["chain"], out["address"], strict=True)]
     out["_evidence_count"] = out.notna().sum(axis=1)
-    out = out.sort_values(["address", "_evidence_count"], ascending=[True, False], kind="mergesort")
-    out = out.drop_duplicates("address", keep="first").drop(columns=["_evidence_count"])
+    out = out.sort_values(["wallet_key", "_evidence_count"], ascending=[True, False], kind="mergesort")
+    out = out.drop_duplicates("wallet_key", keep="first").drop(columns=["_evidence_count"])
     return out.reset_index(drop=True)
 
 

@@ -110,6 +110,37 @@ class QuickNodeCreditBudget:
         }
 
 
+_UNSUPPORTED_HTTP = ("HTTP_400", "HTTP_404", "HTTP_405", "HTTP_413", "HTTP_501")
+_UNSUPPORTED_RPC_HINTS = ("-32601", "-32602", "method not found", "not supported", "unsupported", "jsonparsed")
+
+
+def _is_unsupported_method_error(error: str | None) -> bool:
+    """Erro definitivo de capacidade do provedor (não transitório)."""
+    text = str(error or "")
+    if any(code in text for code in _UNSUPPORTED_HTTP):
+        return True
+    return "RPC_ERROR" in text and any(hint in text.lower() for hint in _UNSUPPORTED_RPC_HINTS)
+
+
+def _method_credits_from_env() -> dict[str, int]:
+    """PEIXAO_QUICKNODE_METHOD_CREDITS='{"getTransaction": 30, "getSignaturesForAddress": 30}'."""
+    raw = os.getenv("PEIXAO_QUICKNODE_METHOD_CREDITS", "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {}
+    out: dict[str, int] = {}
+    if isinstance(value, dict):
+        for key, credits in value.items():
+            try:
+                out[str(key)] = max(1, int(credits))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
 class SolanaRpcRouter:
     """QuickNode-first JSON-RPC router with sticky Helius/Shyft fallbacks."""
 
@@ -122,6 +153,7 @@ class SolanaRpcRouter:
         call_credit_estimate: int = 30,
         timeout: float = 20.0,
         delay: float = 0.075,
+        method_credit_estimates: dict[str, int] | None = None,
     ) -> None:
         providers: list[tuple[str, str]] = []
         qn = str(quicknode_rpc_url or "").strip()
@@ -141,6 +173,13 @@ class SolanaRpcRouter:
         self._sticky_index = 0
         self.provider_calls: dict[str, int] = {}
         self.provider_errors: dict[str, int] = {}
+        # Custo por método (créditos QuickNode), com o estimado geral como padrão.
+        self.method_credit_estimates = {
+            str(k): max(1, int(v)) for k, v in (method_credit_estimates or _method_credits_from_env()).items()
+        }
+        # None = ainda não testado; False = provedor rejeita getMultipleAccounts(jsonParsed).
+        self._multiple_accounts_supported: bool | None = None
+        self.fanout_calls = 0
 
     @property
     def configured(self) -> bool:
@@ -152,14 +191,62 @@ class SolanaRpcRouter:
         start = min(max(0, self._sticky_index), len(self.providers) - 1)
         return list(range(start, len(self.providers))) + list(range(0, start))
 
+    def credits_for(self, method: str) -> int:
+        return self.method_credit_estimates.get(str(method), self.call_credit_estimate)
+
     def call(self, method: str, params: list | dict | None = None) -> tuple[Any | None, str | None, str | None]:
+        """Chamada JSON-RPC; getMultipleAccounts cai para getAccountInfo só quando o
+        provedor rejeita o método (não em timeout, 429 ou 5xx)."""
+        if method != "getMultipleAccounts":
+            return self._call_raw(method, params)
+        if self._multiple_accounts_supported is False:
+            return self._fanout_accounts(params)
+        result, provider, error = self._call_raw(method, params)
+        if error is None:
+            self._multiple_accounts_supported = True
+            return result, provider, None
+        if _is_unsupported_method_error(error):
+            self._multiple_accounts_supported = False
+            return self._fanout_accounts(params, provider=provider, original_error=error)
+        return None, provider, error
+
+    def _fanout_accounts(self, params, provider=None, original_error=None):
+        if not isinstance(params, list) or not params or not isinstance(params[0], list):
+            return None, provider, original_error or "INVALID_MULTIPLE_ACCOUNTS_PARAMS"
+        addresses = [str(x or "").strip() for x in params[0] if str(x or "").strip()]
+        if not addresses:
+            return {"value": []}, provider, None
+        config = params[1] if len(params) > 1 and isinstance(params[1], dict) else {
+            "encoding": "jsonParsed",
+            "commitment": "confirmed",
+        }
+        values: list[Any | None] = []
+        last_provider = provider
+        successes = 0
+        for address in addresses:
+            account_result, account_provider, account_error = self._call_raw("getAccountInfo", [address, config])
+            self.fanout_calls += 1
+            if account_provider:
+                last_provider = account_provider
+            value = account_result.get("value") if isinstance(account_result, dict) else None
+            values.append(value)
+            if account_error is None and isinstance(value, dict):
+                successes += 1
+            if account_error and "BUDGET_EXHAUSTED" in account_error:
+                break
+        if successes:
+            values.extend([None] * (len(addresses) - len(values)))
+            return {"value": values}, last_provider, None
+        return None, last_provider, original_error or "ACCOUNT_INFO_FANOUT_FAILED"
+
+    def _call_raw(self, method: str, params: list | dict | None = None) -> tuple[Any | None, str | None, str | None]:
         if not self.providers:
             return None, None, "NO_RPC_PROVIDER"
 
         last_error = "RPC_FAILED"
         for idx in self._provider_order():
             provider, url = self.providers[idx]
-            if provider == "quicknode" and not self.budget.reserve(self.call_credit_estimate):
+            if provider == "quicknode" and not self.budget.reserve(self.credits_for(method)):
                 last_error = "QUICKNODE_BUDGET_EXHAUSTED"
                 continue
 
@@ -423,7 +510,7 @@ def run_quicknode_solana_discovery(
         if not isinstance(account_values, list):
             continue
 
-        for idx, (largest_row, account) in enumerate(zip(values, account_values), start=1):
+        for idx, (largest_row, account) in enumerate(zip(values, account_values, strict=False), start=1):
             if not isinstance(largest_row, dict) or not isinstance(account, dict):
                 continue
             owner = _token_account_owner(account)
@@ -613,7 +700,7 @@ def merge_quicknode_with_birdeye(
     joined = joined[joined["address"].ne("") & joined["address"].ne("nan")].copy()
 
     merged_rows: list[dict] = []
-    for address, group in joined.groupby("address", sort=False):
+    for _address, group in joined.groupby("address", sort=False):
         records = group.to_dict("records")
         records.sort(
             key=lambda rec: sum(0 if _is_missing(v) else 1 for v in rec.values()),
@@ -669,3 +756,39 @@ def merge_quicknode_with_birdeye(
         "cross_provider_wallets": int(merged.get("quicknode_cross_provider_confirmed", pd.Series(dtype=bool)).fillna(False).sum()),
         "output": str(output_path),
     }
+
+
+def quicknode_solana_enabled() -> bool:
+    from .config import env_bool
+
+    return env_bool("PEIXAO_QUICKNODE_SOLANA", True)
+
+
+def run_quicknode_solana_from_settings(cfg) -> dict:
+    """Mesma configuração para o ciclo rápido (30 min) e o ciclo de 6h.
+
+    Antes cada ciclo tinha seus próprios padrões (25 vs 30 wallets, TTL 1800 vs
+    3600) para as mesmas variáveis de ambiente.
+    """
+    from .config import env_float, env_int
+
+    if not quicknode_solana_enabled():
+        return {"status": "DISABLED", "rpc_calls": 0, "quicknode_credits": 0}
+    return run_quicknode_solana_discovery(
+        cfg.output_dir / "V22_token_radar_shortlist.csv",
+        cfg.output_dir,
+        cfg.state_dir,
+        quicknode_rpc_url=cfg.quicknode_rpc_url,
+        helius_rpc_url=cfg.helius_rpc_url,
+        shyft_rpc_url=cfg.shyft_rpc_url,
+        enabled=True,
+        timeout=env_float("PEIXAO_QUICKNODE_TIMEOUT", 20.0),
+        delay=env_float("PEIXAO_QUICKNODE_DELAY", 0.075),
+        max_tokens=env_int("PEIXAO_QUICKNODE_MAX_TOKENS", 5),
+        max_wallets=env_int("PEIXAO_QUICKNODE_MAX_WALLETS", 30),
+        tx_per_wallet=env_int("PEIXAO_QUICKNODE_TX_PER_WALLET", 80),
+        daily_credit_budget=env_int("PEIXAO_QUICKNODE_DAILY_CREDITS", 330_000),
+        run_credit_budget=env_int("PEIXAO_QUICKNODE_RUN_CREDITS", 75_000),
+        call_credit_estimate=env_int("PEIXAO_QUICKNODE_CALL_CREDITS", 30),
+        cache_ttl_seconds=env_int("PEIXAO_QUICKNODE_CACHE_TTL", 3600),
+    )
