@@ -58,6 +58,8 @@ COST_PROFILES: dict[str, dict[str, float]] = {
         "PEIXAO_NANSEN_WALLETS_PER_CHAIN": 5,
         "PEIXAO_NANSEN_TTL_SECONDS": 3 * 86400,
         "PEIXAO_NANSEN_RETRY_SECONDS": 3 * 86400,
+        "PEIXAO_NO_DATA_RETRY_SECONDS": 14 * 86400,
+        "PEIXAO_ZERION_FALLBACK_BATCH": 5,
         "PEIXAO_MONITOR_REFRESH_SECONDS": 7 * 86400,
         "PEIXAO_LEGACY_NANSEN_BATCH": 5,
         "PEIXAO_LEGACY_ZERION_BATCH": 10,
@@ -90,6 +92,8 @@ COST_PROFILES: dict[str, dict[str, float]] = {
         "PEIXAO_NANSEN_WALLETS_PER_CHAIN": 20,
         "PEIXAO_NANSEN_TTL_SECONDS": 86400,
         "PEIXAO_NANSEN_RETRY_SECONDS": 6 * 3600,
+        "PEIXAO_NO_DATA_RETRY_SECONDS": 7 * 86400,
+        "PEIXAO_ZERION_FALLBACK_BATCH": 20,
         "PEIXAO_MONITOR_REFRESH_SECONDS": 86400,
         "PEIXAO_LEGACY_NANSEN_BATCH": 20,
         "PEIXAO_LEGACY_ZERION_BATCH": 40,
@@ -259,6 +263,8 @@ class Settings:
     nansen_wallets_per_chain: int = cost_int("PEIXAO_NANSEN_WALLETS_PER_CHAIN")
     nansen_ttl_seconds: int = cost_int("PEIXAO_NANSEN_TTL_SECONDS")
     nansen_retry_seconds: int = cost_int("PEIXAO_NANSEN_RETRY_SECONDS")
+    # Wallet consultada que voltou sem histórico só é reconsultada depois disso.
+    no_data_retry_seconds: int = cost_int("PEIXAO_NO_DATA_RETRY_SECONDS")
     monitor_refresh_seconds: int = cost_int("PEIXAO_MONITOR_REFRESH_SECONDS")
     paid_min_priority: float = _float_env("PEIXAO_PAID_MIN_PRIORITY", cost_default("PEIXAO_PAID_MIN_PRIORITY"))
 

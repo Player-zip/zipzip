@@ -341,29 +341,31 @@ def _chain_wallet_stats(
     score_col: str | None,
 ) -> dict:
     if stage.empty:
-        return {"wallets": 0, "scored": 0, "waiting": 0, "alpha": 0}
+        return {"wallets": 0, "scored": 0, "waiting": 0, "ineligible": 0, "alpha": 0}
 
     mask = labels.eq(chain)
     subset = stage.loc[mask]
     wallets = int(len(subset))
-
-    if not score_col or subset.empty:
-        return {
-            "wallets": wallets,
-            "scored": 0,
-            "waiting": wallets,
-            "alpha": 0,
-        }
-
-    scores = pd.to_numeric(subset[score_col], errors="coerce")
+    scores = pd.to_numeric(subset[score_col], errors="coerce") if score_col and not subset.empty else pd.Series(index=subset.index, dtype=float)
     scored = int(scores.notna().sum())
-    alpha = int(_alpha_mask(subset, scores).sum())
+    ineligible = _ineligible_unscored(subset, scores)
+    alpha = int(_alpha_mask(subset, scores).sum()) if score_col and not subset.empty else 0
     return {
         "wallets": wallets,
         "scored": scored,
-        "waiting": max(0, wallets - scored),
+        # Contratos/tipos não elegíveis nunca terão win rate: contados à parte.
+        "waiting": max(0, wallets - scored - ineligible),
+        "ineligible": ineligible,
         "alpha": alpha,
     }
+
+
+def _ineligible_unscored(frame: pd.DataFrame, scores: pd.Series) -> int:
+    from .backlog import is_ineligible
+
+    if frame.empty:
+        return 0
+    return int(sum(1 for (idx, row) in frame.iterrows() if pd.isna(scores.get(idx)) and is_ineligible(row)))
 
 
 def _completed_stage(data_dir: Path) -> pd.DataFrame:
@@ -407,7 +409,8 @@ def _base_status_text(data_dir: Path) -> str:
 
     total = int(len(stage))
     scored = int(scores.notna().sum())
-    waiting = max(0, total - scored)
+    ineligible = _ineligible_unscored(stage, scores) if score_col else 0
+    waiting = max(0, total - scored - ineligible)
     alpha_mask = _alpha_mask(stage, scores) if score_col else pd.Series(False, index=stage.index)
     alpha = int(alpha_mask.sum())
 
@@ -468,15 +471,18 @@ def _base_status_text(data_dir: Path) -> str:
 
     def chain_block(title: str, emoji: str, chain: str) -> str:
         stats = chain_stats[chain]
-        return (
-            f"{emoji} {title}\n"
-            f"🔎 Tokens vistos: {tokens_seen[chain]}\n"
-            f"🎯 Shortlist: {tokens_shortlist[chain]}\n"
-            f"🐋 Wallets acompanhadas: {stats['wallets']}\n"
-            f"📐 Wallets com score: {stats['scored']}\n"
-            f"⏳ Aguardando evidência: {stats['waiting']}\n"
-            f"🚨 Alpha aprovado: {stats['alpha']}\n"
-        )
+        lines = [
+            f"{emoji} {title}",
+            f"🔎 Tokens vistos: {tokens_seen[chain]}",
+            f"🎯 Shortlist: {tokens_shortlist[chain]}",
+            f"🐋 Wallets acompanhadas: {stats['wallets']}",
+            f"📐 Wallets com score: {stats['scored']}",
+            f"⏳ Aguardando evidência: {stats['waiting']}",
+        ]
+        if stats.get("ineligible"):
+            lines.append(f"🚫 Não elegíveis (contrato/tipo): {stats['ineligible']}")
+        lines.append(f"🚨 Alpha aprovado: {stats['alpha']}")
+        return "\n".join(lines) + "\n"
 
     return (
         "🐟 RAULLUX — STATUS MULTICHAIN\n\n"
@@ -492,7 +498,8 @@ def _base_status_text(data_dir: Path) -> str:
         f"🐋 Wallets acompanhadas: {total}\n"
         f"📐 Wallets com score: {scored}\n"
         f"⏳ Aguardando evidência: {waiting}\n"
-        f"🚨 Alpha aprovado: {alpha}\n\n"
+        + (f"🚫 Não elegíveis (contrato/tipo): {ineligible}\n" if ineligible else "")
+        + f"🚨 Alpha aprovado: {alpha}\n\n"
         "📊 NÍVEIS DE SCORE — CONSOLIDADO\n"
         f"🔴 D  <50: {band(0, 50)}\n"
         f"🟠 C  50–59: {band(50, 60)}\n"
@@ -603,8 +610,22 @@ _ADMIN_HELP = (
     "Administração:\n"
     "/convite [pro|basico] [dias] — gera um convite de uso único\n"
     "/usuarios — lista os acessos\n"
-    "/revogar <chat_id> — revoga um acesso"
+    "/revogar <chat_id> — revoga um acesso\n"
+    "/gargalo — por que as wallets estão sem evidência\n"
+    "/acelerar <rede> [n] [extra] — consulta wallets paradas (pede confirmação)\n"
+    "/checar <endereço> [rede] — consulta uma wallet agora\n"
+    "/jobs — últimos pedidos"
 )
+_ADMIN_COMMANDS = {"/convite", "/usuarios", "/revogar", "/gargalo", "/acelerar", "/confirmar", "/cancelar", "/checar", "/jobs"}
+
+
+def _cfg_for(db_path: Path):
+    """Settings apontando para o diretório de dados do banco do bot."""
+    import dataclasses
+
+    from .config import settings
+
+    return dataclasses.replace(settings, data_dir=Path(db_path).parent)
 
 
 def _locked_text(seconds_left: int) -> str:
@@ -646,6 +667,56 @@ def _session_summary(session: dict) -> str:
     expires = int(session.get("access_expires_epoch") or 0)
     validity = f"válido até {_fmt_date(expires)}" if expires else "sem expiração"
     return f"Plano: {plan} ({PLANS.get(plan, '')}) · acesso por {method} · {validity}"
+
+
+def _ops_command(*, token, chat_id, command, args, timeout, db_path: Path) -> str:
+    """Comandos de operação (gargalo e fila de jobs); só registram pedidos."""
+    from . import bot_jobs
+    from .backlog import diagnosis_text
+
+    cfg = _cfg_for(db_path)
+    if command == "/gargalo":
+        _send_chunks(token, chat_id, diagnosis_text(cfg), timeout)
+        return "noop"
+    if command == "/jobs":
+        _send_chunks(token, chat_id, bot_jobs.recent_jobs_text(cfg), timeout)
+        return "noop"
+    if command == "/acelerar":
+        chain = bot_jobs.normalize_chain_arg(args[0]) if args else None
+        if not chain:
+            _send(token, chat_id, "Uso: /acelerar <solana|base|robinhood> [quantidade] [extra]\nVeja antes o /gargalo.", timeout)
+            return "noop"
+        if not cfg.chain_enabled(chain):
+            _send(token, chat_id, f"A rede {chain} está desligada em PEIXAO_CHAINS.", timeout)
+            return "noop"
+        quantity = bot_jobs.DEFAULT_BOOST_WALLETS
+        if len(args) > 1 and args[1].isdigit():
+            quantity = int(args[1])
+        extra = any(a.lower() == "extra" for a in args[1:])
+        job, estimate = bot_jobs.create_boost_job(cfg, chain=chain, quantity=quantity, extra=extra, requested_by=chat_id)
+        _send(token, chat_id, bot_jobs.format_estimate(estimate, job["code"]), timeout)
+        return "job_estimated"
+    if command in {"/confirmar", "/cancelar"}:
+        if not args:
+            _send(token, chat_id, f"Uso: {command} <código>", timeout)
+            return "noop"
+        action = bot_jobs.confirm_job if command == "/confirmar" else bot_jobs.cancel_job
+        _, message = action(cfg, args[0], chat_id)
+        _send(token, chat_id, message, timeout)
+        return "noop"
+    if command == "/checar":
+        if not args:
+            _send(token, chat_id, "Uso: /checar <endereço> [solana|base|robinhood]", timeout)
+            return "noop"
+        address = args[0].strip()
+        chain, error = bot_jobs.chain_of_address(cfg, address, args[1] if len(args) > 1 else None)
+        if not chain:
+            _send(token, chat_id, error, timeout)
+            return "noop"
+        job = bot_jobs.create_wallet_job(cfg, chain=chain, address=address, requested_by=chat_id)
+        _send(token, chat_id, f"🔍 Checagem {job['code']} na fila ({chain}). Aviso aqui com o resultado.", timeout)
+        return "job_queued"
+    return "noop"
 
 
 def _admin_command(conn, *, token, chat_id, command, args, timeout, now) -> str:
@@ -780,11 +851,13 @@ def _handle_message(
         _send(token, chat_id, _blocked_text(), timeout)
         return "blocked"
 
-    if command in {"/convite", "/usuarios", "/revogar"}:
-        if is_admin:
+    if command in _ADMIN_COMMANDS:
+        if not is_admin:
+            _send(token, chat_id, _blocked_text() if not is_auth else "Comando restrito a administradores.", timeout)
+            return "blocked"
+        if command in {"/convite", "/usuarios", "/revogar"}:
             return _admin_command(conn, token=token, chat_id=chat_id, command=command, args=args, timeout=timeout, now=now)
-        _send(token, chat_id, _blocked_text() if not is_auth else "Comando restrito a administradores.", timeout)
-        return "blocked"
+        return _ops_command(token=token, chat_id=chat_id, command=command, args=args, timeout=timeout, db_path=db_path)
 
     if awaiting and not is_auth and not command:
         _delete_message(token, chat_id, message_id, timeout)

@@ -90,7 +90,38 @@ Cada vez que uma wallet atinge um tier pela primeira vez, o sistema grava um sin
 
 O plano `pro` recebe os alertas automáticos; o `basico` só consulta `/status` e `/wallets_bs`.
 
+## Gargalo de evidência: `/gargalo`, `/acelerar`, `/checar` (admins)
+
+Wallets sem win rate não têm score. O `/gargalo` mostra, por rede, o motivo de cada uma estar parada:
+
+| Motivo | O que significa | Acelerar ajuda? |
+|---|---|---|
+| nunca consultadas | nenhuma fonte de PnL tentou ainda | sim |
+| erro no provedor | a última consulta falhou | sim |
+| sem histórico | o provedor respondeu sem posições fechadas | não (reconsulta só após `PEIXAO_NO_DATA_RETRY_SECONDS`) |
+| não elegíveis | contrato ou tipo de endereço que nunca terá win rate | não (ficam fora do "aguardando" no `/status`) |
+
+O `/gargalo` também mostra a saúde e o orçamento de cada fonte (ex.: Nansen pausado por 403 até tal hora).
+
+| Comando | O que faz |
+|---|---|
+| `/acelerar <rede> [n] [extra]` | Seleciona até `n` wallets aceleráveis (nunca consultadas primeiro, por prioridade), mostra o custo estimado e só roda depois de `/confirmar <código>` (vale 10 min). Sem `extra`, respeita o teto diário; com `extra`, autoriza passar do teto só neste job. |
+| `/checar <endereço> [rede]` | Consulta uma wallet agora, ignorando caches. |
+| `/jobs`, `/cancelar <código>` | Lista e cancela pedidos. |
+
+Os pedidos são executados pelo worker **entre** os ciclos (nunca em paralelo com eles). Depois de cada job, a tabela final é reconstruída e o resultado chega no chat: quantas ganharam win rate, tiers, custo e alertas enviados.
+
+Fontes de win rate por rede:
+
+| Rede | Fontes |
+|---|---|
+| Base / Robinhood | Nansen e, quando ele não resolve, Zerion (`PEIXAO_ZERION_FALLBACK`), dentro dos tetos diários |
+| Solana | Birdeye PnL. No ciclo normal só os top traders do Birdeye são consultados; as wallets vindas do QuickNode dependem do `/acelerar solana`. |
+
 ## Mudanças de comportamento desta versão
+
+- **Win rate do GMGN preservado:** wallets legadas com win rate do GMGN não perdem mais o dado ao juntar fontes. No código anterior, uma coluna `win_rate` vazia (NaN) fazia o ledger ignorar o `gmgn_winrate_30d`, e essas wallets apareciam como "aguardando evidência" no ciclo horário.
+- **Zerion como alternativa:** quando o Nansen está pausado ou falha, a Zerion entra automaticamente nas redes Base e Robinhood, dentro do teto diário.
 
 - **Perfil `economy` é o padrão** e reduz bastante o volume de chamadas pagas (tabela acima). Para voltar aos volumes antigos: `PEIXAO_COST_MODE=balanced`. O `.env.example` deixa as variáveis de custo comentadas de propósito, para não anular o perfil.
 - **Backtest antigo substituído:** o `backtest_v23` (fotos de hora em hora, só wallets ainda na tabela) deu lugar ao `score_outcomes`. As tabelas antigas ficam no banco, sem uso.

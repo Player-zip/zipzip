@@ -51,6 +51,9 @@ def test_final_table_is_chain_aware_and_keeps_dune(tmp_path):
     assert solana["dune_new_positions_per_week"] == 2.5
     legacy = frame[frame["chain"].eq("robinhood")].iloc[0]
     assert legacy["realized_roi_30d"] == 3.0  # GMGN já é razão: não vira 0.03
+    # Win rate do GMGN não pode se perder quando outra fonte traz a coluna win_rate.
+    assert legacy["win_rate"] == 0.66
+    assert legacy["selective_alpha_score"] == legacy["selective_alpha_score"]  # tem score (não NaN)
     assert set(frame["realized_roi_unit"]) == {"ratio"}
     assert result["dune_wallets"] == 1
 

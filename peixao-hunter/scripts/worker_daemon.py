@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from peixao import run_v6
 from peixao.bootstrap import project_seed_ready, seed_project_if_needed
+from peixao.bot_jobs import run_next_job
 from peixao.config import env_bool, env_float, env_int, settings
 from peixao.execution_queue import build_execution_queue
 from peixao.priority_validation import run_priority_validation_cycle
@@ -23,7 +24,7 @@ from peixao.robinhood_stream import (
     stream_needs_materialization,
 )
 from peixao.stream_discovery import run_discovery_cycle_stream_first
-from peixao.telegram_auth import process_auth_updates
+from peixao.telegram_auth import _send_chunks, process_auth_updates
 from peixao.telegram_notifier import send_simulation_alert
 
 
@@ -160,6 +161,24 @@ def alpha_simulation_once():
         log("alpha_simulation_error", run_id=run_id, error=f"{type(exc).__name__}: {exc}")
 
 
+def process_bot_job() -> bool:
+    """Roda um job pedido pelo bot (/acelerar, /checar). True se rodou algum."""
+    def notify(chat_id, text):
+        if settings.telegram_bot_token:
+            _send_chunks(settings.telegram_bot_token, chat_id, text, settings.telegram_timeout)
+
+    started = time.time()
+    try:
+        result = run_next_job(settings, notify=notify)
+    except Exception as exc:
+        log("bot_job_error", error=f"{type(exc).__name__}: {exc}")
+        return False
+    if result is None:
+        return False
+    log("bot_job_done", elapsed_s=round(time.time() - started, 2), result=result)
+    return True
+
+
 def ensure_seed(wait_missing: int) -> bool:
     if project_seed_ready(settings):
         return True
@@ -224,6 +243,10 @@ if __name__ == "__main__":
 
     while True:
         if not ensure_seed(wait_missing):
+            continue
+
+        # Pedidos do bot rodam entre os ciclos (nunca em paralelo com eles).
+        if process_bot_job():
             continue
 
         now = time.monotonic()

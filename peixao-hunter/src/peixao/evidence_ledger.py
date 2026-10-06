@@ -171,7 +171,9 @@ def normalize_metrics(provider: str, metrics: dict) -> tuple[dict, list[str]]:
     issues: list[str] = []
 
     raw_wr = metrics.get("win_rate")
-    if raw_wr is None:
+    # NaN (coluna vazia depois de juntar fontes) conta como ausente: sem isso o
+    # win rate do GMGN das wallets legadas era descartado.
+    if _float(raw_wr) is None:
         raw_wr = metrics.get("gmgn_winrate_30d")
     if provider == "NANSEN":
         wr = strict_ratio(raw_wr)
