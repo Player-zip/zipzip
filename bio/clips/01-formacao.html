@@ -1,0 +1,59 @@
+<title>01 Formação</title>
+<style>
+.k{white-space:nowrap;font-family:'Geist Mono',monospace;font-size:17px;letter-spacing:.14em;text-transform:uppercase;color:#22D46A}
+.h{font-size:34px;font-weight:600;letter-spacing:-.02em;color:#fff;white-space:nowrap}
+.mt{color:#A3ABA6}
+.tk{position:absolute;height:4px;border-radius:2px;background:rgba(255,255,255,.16)}
+.tf{position:absolute;height:4px;border-radius:2px;background:#22D46A}
+.dot{position:absolute;width:18px;height:18px;margin:-7px 0 0 -9px;border-radius:50%;background:#22D46A;box-shadow:0 0 0 5px rgba(34,212,106,.22)}
+.yr{position:absolute;width:160px;margin-left:-80px;text-align:center;font-size:30px;font-weight:600;color:#fff}
+.lb{position:absolute;width:180px;margin-left:-90px;text-align:center;font-size:18px;color:#A3ABA6}
+.rw{position:absolute;left:-280px;width:560px}
+.rw b{display:block;font-size:28px;font-weight:600;color:#fff}
+.rw span{display:block;font-size:19px;color:#A3ABA6;margin-top:4px;white-space:normal}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:9px 18px;border-radius:999px;background:rgba(34,212,106,.16);color:#fff;font-size:21px;font-weight:500}
+.chip i{width:9px;height:9px;border-radius:50%;background:#22D46A}
+</style>
+<div data-slot="shape">
+  <div class="L" id="Lp"><div class="row" style="transform:translate(-50%,-50%);gap:12px;color:#fff;font-size:26px;font-weight:500"><i style="width:12px;height:12px;border-radius:50%;background:#22D46A"></i>Minha história profissional</div></div>
+  <div class="L" id="Lef">
+    <div class="a k" style="left:-280px;top:30px">formação · UEL</div>
+    <div class="a h" style="left:-280px;top:58px">Educação Física</div>
+    <div class="tk" style="left:-250px;top:160px;width:500px"></div><div class="tf" id="ef_f" style="left:-250px;top:160px;width:0"></div>
+    <div id="e0"><div class="dot" style="left:-250px;top:160px"></div><div class="yr" style="left:-250px;top:186px">2008</div><div class="lb" style="left:-250px;top:226px">o interesse</div></div>
+    <div id="e1"><div class="dot" style="left:0;top:160px"></div><div class="yr" style="left:0;top:186px">2009</div><div class="lb" style="left:0;top:226px">início do curso</div></div>
+    <div id="e2"><div class="dot" style="left:250px;top:160px"></div><div class="yr" style="left:250px;top:186px">2012</div><div class="lb" style="left:250px;top:226px">formado</div></div>
+    <div class="a" id="e10" style="left:-280px;top:272px"><span class="chip"><i></i>10 anos na área</span></div>
+  </div>
+  <div class="L" id="Lnu">
+    <div class="a k" style="left:-280px;top:30px">a vontade de sempre</div>
+    <div class="a h" style="left:-280px;top:58px">Nutrição</div>
+    <div class="tk" style="left:-200px;top:160px;width:400px"></div><div class="tf" id="nu_f" style="left:-200px;top:160px;width:0"></div>
+    <div id="n0"><div class="dot" style="left:-200px;top:160px"></div><div class="yr" style="left:-200px;top:186px">2018</div><div class="lb" style="left:-200px;top:226px">início do curso</div></div>
+    <div id="n1"><div class="dot" style="left:200px;top:160px"></div><div class="yr" style="left:200px;top:186px">2021</div><div class="lb" style="left:200px;top:226px">formado · Nopar</div></div>
+  </div>
+</div><!--/shape-->
+<script>
+const $=id=>document.getElementById(id);
+function pop(el,t,tin,dy=12){const v=M.vis(t,tin,null,{din:0,lin:0.24});el.style.opacity=v.o;
+  el.style.filter=v.blur>0.05?`blur(${v.blur}px)`:'none';el.style.transform=`translateY(${(1-v.a)*dy}px)`;}
+
+const T={"hist": 0.15, "f_in": 2.8, "f2008": 7.8, "f2009": 9.2, "f2012": 10.7, "fuel": 11.9, "f10": 13.92, "n_in": 16.03, "n2018": 19.43, "n2021": 22.03, "nopar": 23.73, "f_out": 24.43};
+const efW=M.track(0,[[T.f2009,250,M.SLOW],[T.f2012,500,M.SLOW]]), nuW=M.track(0,[[T.n2021,400,M.SLOW]]);
+M.scene({
+  W:720,H:1280,bg:null,T:T.f_out+0.6,center:[360,230],intro:0.15,
+  SH:{pill:{w:470,h:72,r:36,bg:'#0B0B0B',cam:1}, ef:{w:640,h:330,r:30,bg:'#0B0B0B',cam:1},
+       efx:{w:640,h:350,r:30,bg:'#0B0B0B',cam:1}, nu:{w:640,h:290,r:30,bg:'#0B0B0B',cam:1}, end:{w:120,h:40,r:20,bg:'#0B0B0B',cam:1}},
+  start:'pill', SEQ:[[T.f_in,'ef'],[T.f10-0.05,'efx'],[T.n_in,'nu'],[T.f_out,'end']],
+  layers:[
+    {el:'Lp',tin:0.15,tout:T.f_in},
+    {el:'Lef',tin:T.f_in,tout:T.n_in,anchor:'t',update:(t)=>{
+      $('ef_f').style.width=Math.max(0,efW(t))+'px';
+      pop($('e0'),t,T.f2008-0.1); pop($('e1'),t,T.f2009); pop($('e2'),t,T.f2012); pop($('e10'),t,T.f10);
+    }},
+    {el:'Lnu',tin:T.n_in,tout:T.f_out,anchor:'t',update:(t)=>{
+      $('nu_f').style.width=Math.max(0,nuW(t))+'px'; pop($('n0'),t,T.n2018); pop($('n1'),t,T.n2021);
+    }},
+  ],
+});
+</script>

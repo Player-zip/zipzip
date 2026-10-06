@@ -1,0 +1,59 @@
+<title>02 Credenciais</title>
+<style>
+.k{white-space:nowrap;font-family:'Geist Mono',monospace;font-size:17px;letter-spacing:.14em;text-transform:uppercase;color:#22D46A}
+.h{font-size:34px;font-weight:600;letter-spacing:-.02em;color:#fff;white-space:nowrap}
+.mt{color:#A3ABA6}
+.tk{position:absolute;height:4px;border-radius:2px;background:rgba(255,255,255,.16)}
+.tf{position:absolute;height:4px;border-radius:2px;background:#22D46A}
+.dot{position:absolute;width:18px;height:18px;margin:-7px 0 0 -9px;border-radius:50%;background:#22D46A;box-shadow:0 0 0 5px rgba(34,212,106,.22)}
+.yr{position:absolute;width:160px;margin-left:-80px;text-align:center;font-size:30px;font-weight:600;color:#fff}
+.lb{position:absolute;width:180px;margin-left:-90px;text-align:center;font-size:18px;color:#A3ABA6}
+.rw{position:absolute;left:-280px;width:560px}
+.rw b{display:block;font-size:28px;font-weight:600;color:#fff}
+.rw span{display:block;font-size:19px;color:#A3ABA6;margin-top:4px;white-space:normal}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:9px 18px;border-radius:999px;background:rgba(34,212,106,.16);color:#fff;font-size:21px;font-weight:500}
+.chip i{width:9px;height:9px;border-radius:50%;background:#22D46A}
+</style>
+<div data-slot="shape">
+  <div class="L" id="Lpos">
+    <div class="a k" style="left:-280px;top:30px">sempre buscando conhecimento</div>
+    <div class="a h" style="left:-280px;top:58px">2 pós-graduações</div>
+    <div class="rw" id="p0" style="top:122px"><b>USP</b><span>Nutrição esportiva e obesidade</span></div>
+    <div class="rw" id="p1" style="top:206px"><b>Unibasul</b><span>Nutrição e fisiologia aplicadas ao exercício</span></div>
+  </div>
+  <div class="L" id="Lcert">
+    <div class="a k" style="left:-280px;top:30px">nutrição esportiva</div>
+    <div class="a h" style="left:-280px;top:58px">2 certificações internacionais</div>
+    <div class="row" id="q0" style="left:-280px;top:130px;gap:14px;font-size:28px;font-weight:600;color:#fff"><span class="ic"></span>ACSM</div>
+    <div class="row" id="q1" style="left:-280px;top:186px;gap:14px;font-size:28px;font-weight:600;color:#fff"><span class="ic"></span>Clube Barcelona</div>
+  </div>
+  <div class="L" id="Labne">
+    <div class="a k" style="left:-280px;top:30px">membro</div>
+    <div class="a" style="left:-280px;top:58px;width:560px;font-size:30px;font-weight:600;line-height:1.2;color:#fff">Associação Brasileira de Nutrição Esportiva</div>
+  </div>
+  <div class="L" id="Latu">
+    <div class="a k" style="left:-280px;top:30px">desde então</div>
+    <div class="a" style="left:-280px;top:58px;width:560px;font-size:30px;font-weight:600;line-height:1.2;color:#fff">Nutricionista especialista em <span style="color:#22D46A">emagrecimento</span></div>
+    <div class="row" style="left:-280px;top:170px;gap:10px"><span class="chip" id="l0"><i></i>Londrina</span><span class="chip" id="l1"><i></i>Maringá</span><span class="chip" id="l2"><i></i>Online</span></div>
+  </div>
+</div><!--/shape-->
+<script>
+const $=id=>document.getElementById(id);
+function pop(el,t,tin,dy=12){const v=M.vis(t,tin,null,{din:0,lin:0.24});el.style.opacity=v.o;
+  el.style.filter=v.blur>0.05?`blur(${v.blur}px)`:'none';el.style.transform=`translateY(${(1-v.a)*dy}px)`;}
+
+const T={"c_in": 0.15, "usp": 0.95, "uni": 4.93, "cert": 9.3, "acsm": 13.73, "bar": 15.44, "abne": 17.94, "a_in": 21.83, "emag": 25.13, "lon": 26.23, "mar": 27.03, "onl": 27.93, "a_out": 28.71};
+document.querySelectorAll('#Lcert .ic').forEach(e=>e.innerHTML=M.icon('check',30,'#22D46A',2.6));
+M.scene({
+  W:720,H:1280,bg:null,T:T.a_out+0.6,center:[360,230],intro:0.15,
+  SH:{pos:{w:640,h:310,r:30,bg:'#0B0B0B',cam:1}, cert:{w:640,h:250,r:30,bg:'#0B0B0B',cam:1},
+       abne:{w:640,h:170,r:30,bg:'#0B0B0B',cam:1}, atu:{w:640,h:240,r:30,bg:'#0B0B0B',cam:1}, end:{w:120,h:40,r:20,bg:'#0B0B0B',cam:1}},
+  start:'pos', SEQ:[[T.cert,'cert'],[T.abne-0.1,'abne'],[T.a_in,'atu'],[T.a_out,'end']],
+  layers:[
+    {el:'Lpos',tin:0.15,tout:T.cert,anchor:'t',update:(t)=>{pop($('p0'),t,T.usp);pop($('p1'),t,T.uni);}},
+    {el:'Lcert',tin:T.cert,tout:T.abne-0.1,anchor:'t',update:(t)=>{pop($('q0'),t,T.acsm);pop($('q1'),t,T.bar);}},
+    {el:'Labne',tin:T.abne-0.1,tout:T.a_in,anchor:'t'},
+    {el:'Latu',tin:T.a_in,tout:T.a_out,anchor:'t',update:(t)=>{pop($('l0'),t,T.lon,8);pop($('l1'),t,T.mar,8);pop($('l2'),t,T.onl,8);}},
+  ],
+});
+</script>
