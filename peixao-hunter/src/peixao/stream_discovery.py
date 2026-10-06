@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .config import Settings, env_bool, env_float, env_int, settings
+from .config import Settings, cost_int, env_bool, env_float, env_int, settings
 from .execution_queue import build_execution_queue
 from .multichain_runner import _base_discovery, _quicknode_discovery, _robinhood_discovery, _solana_token_radar
 from .robinhood_incremental import run_robinhood_radar_incremental
@@ -47,10 +47,13 @@ def _rpc_scan_fallback(cfg: Settings, *, ttl_seconds: int) -> dict:
         chunk_blocks=env_int("PEIXAO_ROBINHOOD_FAST_LOG_CHUNK_BLOCKS", 9500),
         max_logs_per_token=env_int("PEIXAO_ROBINHOOD_MAX_LOGS_PER_TOKEN", 1200),
         max_rps=env_float("PEIXAO_ROBINHOOD_MAX_RPS", 15.0),
+        prefer_free_rpc=env_bool("PEIXAO_ROBINHOOD_PREFER_FREE_RPC", bool(cost_int("PEIXAO_ROBINHOOD_PREFER_FREE_RPC"))),
     )
 
 
 def _stream_first_robinhood(cfg: Settings, *, ttl_seconds: int) -> dict:
+    if not cfg.chain_enabled("robinhood"):
+        return {"status": "CHAIN_DISABLED", "chain": "robinhood", "http_calls": 0}
     if not _stream_enabled():
         return _rpc_scan_fallback(cfg, ttl_seconds=ttl_seconds)
 
@@ -96,7 +99,11 @@ def run_discovery_cycle_stream_first(*, cfg: Settings = settings) -> dict:
     # as early as possible after a Railway restart.
     robinhood = safe_call("fast_robinhood_stream", lambda: _stream_first_robinhood(cfg, ttl_seconds=fast_ttl))
     solana_radar = safe_call("fast_solana_radar", lambda: _solana_token_radar(cfg, ttl_seconds=fast_ttl))
-    solana_wallets = safe_call("fast_quicknode_solana", lambda: _quicknode_discovery(cfg))
+    # QuickNode Solana gasta créditos: no perfil economy roda só no ciclo de 6h.
+    if env_bool("PEIXAO_QUICKNODE_FAST_CYCLE", bool(cost_int("PEIXAO_QUICKNODE_FAST_CYCLE"))):
+        solana_wallets = safe_call("fast_quicknode_solana", lambda: _quicknode_discovery(cfg))
+    else:
+        solana_wallets = {"status": "SKIPPED_COST_PROFILE", "quicknode_credits": 0}
     base = safe_call("fast_base_radar", lambda: _base_discovery(cfg, ttl_seconds=fast_ttl))
     queue = safe_call("fast_execution_queue", lambda: build_execution_queue(
         cfg.output_dir,

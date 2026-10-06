@@ -18,6 +18,18 @@ def _cooldown_seconds(statuses: list[int]) -> int:
     return 0
 
 
+def _priority_of(row: dict) -> float:
+    """Sinal barato já calculado na fila; sem ele, a wallet não é barrada."""
+    for key in ("execution_priority_score", "discovery_score"):
+        value = row.get(key)
+        try:
+            if value is not None and not pd.isna(value):
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return float("inf")
+
+
 def enrich_nansen_pnl_priority(
     input_path: Path,
     output_path: Path,
@@ -30,11 +42,16 @@ def enrich_nansen_pnl_priority(
     ttl_seconds: int = 86400,
     max_wallets: int = 20,
     delay: float = 0.15,
+    min_priority: float = 0.0,
+    retry_seconds: int = 6 * 3600,
 ) -> dict:
     """Spend live-call budget only on stale/new wallets and stop on provider denial.
 
     Fresh cache is always applied for free. A 403 or 429 opens a provider-level
     cooldown so the remaining queue is not hammered with calls that cannot work.
+    Wallets abaixo de ``min_priority`` (sinal barato fraco) não geram chamada
+    paga, e uma wallet que falhou não é consultada de novo antes de
+    ``retry_seconds``.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -59,6 +76,7 @@ def enrich_nansen_pnl_priority(
     provider_state_path = state_dir / f"nansen_provider_{chain}_state.json"
     cache = _load_json(cache_path)
     entries = cache.get("entries") if isinstance(cache.get("entries"), dict) else {}
+    failures = cache.get("failures") if isinstance(cache.get("failures"), dict) else {}
     provider_state = _load_json(provider_state_path)
     now = int(time.time())
     cooldown_until = int(provider_state.get("cooldown_until", 0) or 0)
@@ -66,6 +84,7 @@ def enrich_nansen_pnl_priority(
 
     rows = frame.to_dict("records")
     enriched = live_enriched = errors = http_calls = live_attempts = cache_hits = 0
+    skipped_low_priority = skipped_recent_failure = 0
     credits_used = 0.0
     statuses: list[int] = []
     live_limit = max(0, int(max_wallets))
@@ -80,8 +99,13 @@ def enrich_nansen_pnl_priority(
             and now - int(cached.get("checked_epoch", 0) or 0) < max(0, int(ttl_seconds))
         )
         metrics = upgrade_cached_metrics(cached.get("metrics")) if fresh else None
+        failed_epoch = int((failures.get(address) or {}).get("failed_epoch", 0) or 0)
         if fresh:
             cache_hits += 1
+        elif _priority_of(row) < float(min_priority):
+            skipped_low_priority += 1
+        elif failed_epoch and now - failed_epoch < max(0, int(retry_seconds)):
+            skipped_recent_failure += 1
         elif not provider_blocked and live_attempts < live_limit:
             live_attempts += 1
             metrics, meta = _fetch_wallet(
@@ -97,6 +121,7 @@ def enrich_nansen_pnl_priority(
             statuses.extend(attempt_statuses)
             if metrics is None:
                 errors += 1
+                failures[address] = {"failed_epoch": now, "statuses": attempt_statuses}
                 cooldown = _cooldown_seconds(attempt_statuses)
                 if cooldown > 0:
                     cooldown_until = now + cooldown
@@ -112,6 +137,7 @@ def enrich_nansen_pnl_priority(
                     time.sleep(float(delay))
                 continue
             live_enriched += 1
+            failures.pop(address, None)
             entries[address] = {
                 "checked_epoch": now,
                 "checked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -131,7 +157,7 @@ def enrich_nansen_pnl_priority(
 
     out = pd.DataFrame(rows)
     out.to_csv(output_path, index=False)
-    _atomic_json(cache_path, {"entries": entries})
+    _atomic_json(cache_path, {"entries": entries, "failures": failures})
     if provider_blocked and http_calls == 0:
         status = "COOLDOWN"
     elif errors:
@@ -150,7 +176,38 @@ def enrich_nansen_pnl_priority(
         "http_calls": int(http_calls),
         "credits_used": round(float(credits_used), 4),
         "http_statuses": sorted(set(statuses)),
+        "skipped_low_priority": int(skipped_low_priority),
+        "skipped_recent_failure": int(skipped_recent_failure),
         "provider_cooldown": bool(provider_blocked),
         "provider_cooldown_until": int(cooldown_until) if provider_blocked else 0,
         "output": str(output_path),
     }
+
+
+def run_nansen_priority(cfg, chain: str, input_path: Path, *, max_wallets: int) -> dict:
+    """Nansen na fila de prioridade, dentro do teto diário e do perfil de custo.
+
+    Sem orçamento o lote vira 0: o cache fresco continua sendo aplicado de graça
+    e o arquivo de saída é atualizado normalmente.
+    """
+    from .cost_control import UNITS_PER_WALLET, budgeted_batch, record_spend
+
+    output_path = cfg.output_dir / f"V22_{chain}_wallet_enriched.csv"
+    if not cfg.chain_enabled(chain):
+        return {"status": "CHAIN_DISABLED", "chain": chain, "http_calls": 0}
+    batch = budgeted_batch(cfg.master_db, "NANSEN", max_wallets, units_per_item=UNITS_PER_WALLET["NANSEN"])
+    result = enrich_nansen_pnl_priority(
+        input_path,
+        output_path,
+        cfg.state_dir,
+        api_key=cfg.nansen_api_key,
+        chain=chain,
+        timeout=max(cfg.rpc_timeout, 15.0),
+        lookback_days=30,
+        ttl_seconds=cfg.nansen_ttl_seconds,
+        max_wallets=batch,
+        min_priority=cfg.paid_min_priority,
+        retry_seconds=cfg.nansen_retry_seconds,
+    )
+    record_spend(cfg.master_db, "NANSEN", float(result.get("http_calls", 0) or 0), chain=chain, stage="nansen_priority")
+    return {**result, "budgeted_batch": int(batch)}

@@ -17,7 +17,9 @@ DEFAULT_EVIDENCE_MAX_AGE_DAYS = 30
 # Observações antigas (exceto a última de cada provedor/métrica) são apagadas.
 DEFAULT_EVIDENCE_RETENTION_DAYS = 120
 # Provedores cujos caches são sincronizados com data e atribuição corretas.
-CACHE_SYNCED_PROVIDERS = {"NANSEN", "ZERION", "COINSTATS"}
+CACHE_SYNCED_PROVIDERS = {"NANSEN", "ZERION", "COINSTATS", "BIRDEYE"}
+# Metodologia das linhas copiadas do pipeline (sem data real de consulta).
+ROW_METHODOLOGY = "pipeline source row"
 EVM_CHAINS = {"base", "robinhood", "ethereum", "evm"}
 
 _PROVIDER_PRIORITY = {
@@ -359,6 +361,7 @@ def sync_provider_caches(state_dir: Path, db_path: Path) -> dict:
         ("NANSEN", "nansen_pnl_*_cache.json", "Nansen 30d profiler PnL", 1.0),
         ("ZERION", "zerion_pnl_*_cache.json", "Zerion 30d wallet PnL", 0.9),
         ("COINSTATS", "coinstats_30d_*_cache.json", "CoinStats 30d realized PnL", 0.85),
+        ("BIRDEYE", "birdeye_pnl_cache.json", "Birdeye wallet PnL summary", 0.8),
     )
     observations = entries_seen = files = 0
     issue_counts: dict[str, int] = {}
@@ -372,12 +375,15 @@ def sync_provider_caches(state_dir: Path, db_path: Path) -> dict:
                     chain = name[len("nansen_pnl_"):-len("_cache.json")]
                 elif provider == "ZERION":
                     chain = name[len("zerion_pnl_"):-len("_cache.json")]
+                elif provider == "BIRDEYE":
+                    chain = "solana"
                 else:
                     chain = name[len("coinstats_30d_"):-len("_cache.json")]
                 payload = _load_json(path)
-                entries = payload.get("entries") if isinstance(payload.get("entries"), dict) else {}
+                key = "wallets" if provider == "BIRDEYE" else "entries"
+                entries = payload.get(key) if isinstance(payload.get(key), dict) else {}
                 for address, item in entries.items():
-                    if not isinstance(item, dict) or not isinstance(item.get("metrics"), dict):
+                    if not isinstance(item, dict) or not isinstance(item.get("metrics"), dict) or not item["metrics"]:
                         continue
                     entries_seen += 1
                     result = record_metrics(

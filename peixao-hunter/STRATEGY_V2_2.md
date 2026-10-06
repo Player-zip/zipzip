@@ -275,6 +275,27 @@ Prediction Layer
 
 O Peixão Score deve ser tratado como score heurístico de edge até existir backtest walk-forward e calibração suficiente para convertê-lo em probabilidade real.
 
+## Custo mínimo (implementado)
+
+Princípio: gasto pago só onde o sinal barato já justificou. Ver a seção "Custo" do README.
+
+- Perfil `economy` como padrão e teto diário fail-closed por provedor pago.
+- Cache e TTL longos; cache negativo para wallets sem dado no provedor.
+- Filtro de prioridade antes de qualquer enriquecimento pago.
+- Fontes grátis primeiro (RPC público antes de Alchemy).
+- Métrica de acompanhamento: **custo por wallet alpha nova**.
+
+## Backtest honesto (implementado)
+
+O "Prediction Layer" mede o score com o que o pipeline já coleta, sem chamadas extras:
+
+- sinais imutáveis por tier;
+- resultado em 7/14/30 dias só com observações reais de provedor;
+- sem viés de sobrevivência;
+- tiers C/D como controle.
+
+A calibração dos pesos deve usar este resumo quando houver amostra suficiente por tier.
+
 ## Compatibilidade
 
 - V5 permanece congelada como golden backup.

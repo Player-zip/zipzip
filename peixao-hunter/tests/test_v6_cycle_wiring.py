@@ -21,7 +21,7 @@ def _stub_legacy(monkeypatch):
     for name in (
         "apply_cached_gmgn", "build_alpha_v22_stage1", "record_ranked_v1_csv", "record_alpha22_stage1_csv",
         "probe_mobula", "probe_jupiter", "probe_solana_tracker", "probe_dune", "run_token_radar",
-        "run_quicknode_solana_from_settings", "run_birdeye_alpha_discovery", "merge_quicknode_with_birdeye",
+        "run_quicknode_solana_budgeted", "run_birdeye_alpha_discovery", "merge_quicknode_with_birdeye",
         "enrich_stage1_with_dune", "send_test_alert_once",
     ):
         monkeypatch.setattr(runner, name, _ok())

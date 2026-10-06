@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from .adaptive_queue import adaptive_provider_limit, build_adaptive_execution_queue
-from .backtest_v23 import update_backtest
 from .config import Settings, env_int, settings
 from .final_stage import FINAL_STAGE1, build_final_stage1, first_existing
 from .monitor_state_v23 import update_monitor_from_stage
 from .observability_v23 import publish_efficiency_snapshot, record_priority_provider_stats
-from .priority_enrichment import enrich_nansen_pnl_priority
+from .priority_enrichment import run_nansen_priority
+from .score_outcomes import SUMMARY_FILE, update_score_outcomes
 from .state import persist_summary, safe_call, utc_now
 from .telegram_notifier import notify_alpha_wallets
 
@@ -29,7 +29,7 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
     ))
 
     due_by_chain = queue.get("due_by_chain") if isinstance(queue.get("due_by_chain"), dict) else {}
-    base_limit_default = max(0, env_int("PEIXAO_NANSEN_WALLETS_PER_CHAIN", 20))
+    base_limit_default = max(0, cfg.nansen_wallets_per_chain)
     base_limit = adaptive_provider_limit(
         db_path, "NANSEN", "base", base_limit_default,
         backlog=int(due_by_chain.get("base", 0) or 0),
@@ -48,27 +48,11 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
         cfg.output_dir / "V22_robinhood_wallet_candidates.csv",
     )
 
-    base_nansen = safe_call("base_nansen_pnl", lambda: enrich_nansen_pnl_priority(
-        base_priority,
-        cfg.output_dir / "V22_base_wallet_enriched.csv",
-        cfg.state_dir,
-        api_key=cfg.nansen_api_key,
-        chain="base",
-        timeout=max(cfg.rpc_timeout, 15.0),
-        lookback_days=30,
-        ttl_seconds=cfg.birdeye_pnl_ttl_seconds,
-        max_wallets=base_limit,
+    base_nansen = safe_call("base_nansen_pnl", lambda: run_nansen_priority(
+        cfg, "base", base_priority, max_wallets=base_limit,
     ))
-    robinhood_nansen = safe_call("robinhood_nansen_pnl", lambda: enrich_nansen_pnl_priority(
-        robinhood_priority,
-        cfg.output_dir / "V22_robinhood_wallet_enriched.csv",
-        cfg.state_dir,
-        api_key=cfg.nansen_api_key,
-        chain="robinhood",
-        timeout=max(cfg.rpc_timeout, 15.0),
-        lookback_days=30,
-        ttl_seconds=cfg.birdeye_pnl_ttl_seconds,
-        max_wallets=robinhood_limit,
+    robinhood_nansen = safe_call("robinhood_nansen_pnl", lambda: run_nansen_priority(
+        cfg, "robinhood", robinhood_priority, max_wallets=robinhood_limit,
     ))
 
     provider_stats = safe_call("provider_stats", lambda: record_priority_provider_stats(
@@ -89,16 +73,18 @@ def run_priority_validation_cycle(*, cfg: Settings = settings) -> dict:
         }
     stage1 = cfg.output_dir / FINAL_STAGE1
 
-    backtest = safe_call("score_replay", lambda: update_backtest(
+    # Backtest honesto: sinais imutáveis por tier e resultado com observações
+    # reais já coletadas (nenhuma chamada extra de API).
+    backtest = safe_call("score_outcomes", lambda: update_score_outcomes(
         stage1,
         db_path,
-        cfg.output_dir / "V22_backtest_summary.csv",
+        cfg.output_dir / SUMMARY_FILE,
     ))
     monitor_state = safe_call("monitor_state", lambda: update_monitor_from_stage(
         db_path,
         stage1,
         cfg.output_dir / "V22_execution_queue.csv",
-        refresh_seconds=env_int("PEIXAO_MONITOR_REFRESH_SECONDS", 86400),
+        refresh_seconds=cfg.monitor_refresh_seconds,
     ))
     observability = safe_call("efficiency_snapshot", lambda: publish_efficiency_snapshot(
         output_dir=cfg.output_dir,

@@ -4,7 +4,8 @@ from pathlib import Path
 import pandas as pd
 
 from .evidence_ledger import infer_chain, normalize_address, wallet_key
-from .telegram_auth import authorized_chat_ids, ensure_auth_schema
+from .score_outcomes import tier_track_record, track_record_text
+from .telegram_auth import ALERT_PLANS, authorized_chat_ids
 
 def _truthy(v):
     return v if isinstance(v, bool) else str(v).strip().lower() in {"1","true","yes","y"}
@@ -22,7 +23,7 @@ def _wr(v):
         return "{:.1f}%".format(x)
     except Exception: return "n/d"
 
-def _message(r):
+def _message(r, track_record=None):
     address=str(r.get("address","")).strip()
     # Mesma regra de rede do /status: linha legada sem `chain` é Robinhood, não Solana.
     chain=infer_chain(r).title()
@@ -33,12 +34,13 @@ def _message(r):
         "🧠 <b>Selective Score:</b> {}/100\n📈 <b>Win Rate:</b> {}\n💰 <b>PnL 30d:</b> ${}\n"
         "🗓️ <b>Novas posições/semana:</b> {}\n📊 <b>Cobertura de evidência:</b> {}\n"
         "🧬 <b>Perfil:</b> {}\n\n<code>{}</code>\n\n"
-        "✅ Passou naturalmente pelo gate final Selective Alpha."
+        "✅ Passou naturalmente pelo gate final Selective Alpha.{}"
     ).format(html.escape(chain),html.escape(str(r.get("selective_alpha_tier","ALPHA"))),
       _num(r.get("selective_alpha_score")),_num(r.get("selective_score")),
       _wr(r.get("selective_win_rate",r.get("gmgn_winrate_30d"))),_num(r.get("realized_profit_30d")),
       _num(r.get("selective_new_positions_per_week")),_num(coverage,0,"%"),
-      html.escape(str(r.get("selective_profile","UNKNOWN"))),html.escape(address))
+      html.escape(str(r.get("selective_profile","UNKNOWN"))),html.escape(address),
+      ("\n" + html.escape(track_record)) if track_record else "")
 
 def _send(token, chat_id, text, timeout):
     url="https://api.telegram.org/bot{}/sendMessage".format(token)
@@ -54,11 +56,8 @@ def _send(token, chat_id, text, timeout):
         return {"ok":False,"http_status":None,"error":type(exc).__name__}
 
 def _recipients(conn, access_password=None, auth_ttl_days=0):
-    """Só sessões válidas: com a senha vigente e dentro da validade."""
-    if access_password:
-        return authorized_chat_ids(conn, access_password, ttl_days=auth_ttl_days)
-    ensure_auth_schema(conn)
-    return [str(r[0]) for r in conn.execute("SELECT chat_id FROM telegram_auth WHERE authorized=1").fetchall()]
+    """Só sessões válidas e de planos que recebem alertas automáticos."""
+    return authorized_chat_ids(conn, access_password, ttl_days=auth_ttl_days, plans=ALERT_PLANS)
 
 def notify_alpha_wallets(stage1_path:Path, db_path:Path, *, token, chat_id=None, enabled=True, timeout=10.0,
                          access_password=None, auth_ttl_days=0):
@@ -94,13 +93,16 @@ def notify_alpha_wallets(stage1_path:Path, db_path:Path, *, token, chat_id=None,
             legacy_keys=(delivery_key, address, raw_address)
             version=str(r.get("selective_score_version","V2.2S1"))
             score=r.get("selective_alpha_score")
+            tier=str(r.get("selective_alpha_tier","") or "")
+            # Histórico real do tier (backtest 30d) junto do alerta.
+            track=track_record_text(tier_track_record(stage1_path.parent, tier), tier) if tier else None
             for recipient in recipients:
                 if conn.execute(
                     "SELECT 1 FROM telegram_alpha_deliveries WHERE address IN (?,?,?) AND score_version=? AND chat_id=?",
                     (*legacy_keys, version, recipient),
                 ).fetchone():
                     skipped+=1; continue
-                result=_send(token,recipient,_message(r),timeout)
+                result=_send(token,recipient,_message(r, track),timeout)
                 if result.get("ok"):
                     conn.execute("INSERT OR REPLACE INTO telegram_alpha_deliveries(address,score_version,chat_id,last_tier,last_score) VALUES(?,?,?,?,?)",
                       (delivery_key,version,recipient,str(r.get("selective_alpha_tier","")),None if pd.isna(score) else float(score)))

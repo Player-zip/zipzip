@@ -3,11 +3,18 @@ from __future__ import annotations
 from .adaptive_queue import build_adaptive_execution_queue
 from .base_radar import run_base_radar
 from .coinstats_enrichment import enrich_coinstats_fallback
-from .config import Settings, env_float, env_int, settings
+from .config import Settings, cost_int, env_bool, env_float, env_int, settings
+from .cost_control import (
+    UNITS_PER_WALLET,
+    budgeted_batch,
+    http_calls,
+    record_spend,
+    run_paid_step,
+)
 from .execution_queue import build_execution_queue
 from .final_stage import FINAL_STAGE1, build_final_stage1, first_existing
-from .priority_enrichment import enrich_nansen_pnl_priority
-from .quicknode_solana import run_quicknode_solana_from_settings
+from .priority_enrichment import run_nansen_priority
+from .quicknode_solana import run_quicknode_solana_budgeted
 from .robinhood_incremental import run_robinhood_radar_incremental
 from .rotating_enrichment import enrich_legacy_robinhood_rotating
 from .runner import run_v6 as run_v6_legacy
@@ -20,10 +27,12 @@ _safe = safe_call
 
 
 def _quicknode_discovery(cfg: Settings) -> dict:
-    return run_quicknode_solana_from_settings(cfg)
+    return run_quicknode_solana_budgeted(cfg)
 
 
 def _base_discovery(cfg: Settings, *, ttl_seconds: int) -> dict:
+    if not cfg.chain_enabled("base"):
+        return {"status": "CHAIN_DISABLED", "chain": "base", "http_calls": 0}
     return run_base_radar(
         cfg.output_dir,
         cfg.state_dir,
@@ -38,11 +47,14 @@ def _base_discovery(cfg: Settings, *, ttl_seconds: int) -> dict:
         min_radar_score=cfg.token_radar_min_score,
         min_cross_token_hits=cfg.birdeye_min_cross_token_hits,
         max_wallets=env_int("PEIXAO_BASE_MAX_WALLETS", 60),
+        wallet_ttl_seconds=cost_int("PEIXAO_BASE_WALLET_TTL"),
     )
 
 
 def _robinhood_discovery(cfg: Settings, *, ttl_seconds: int) -> dict:
     """Varredura de logs de 6h (reconciliação/backfill do stream)."""
+    if not cfg.chain_enabled("robinhood"):
+        return {"status": "CHAIN_DISABLED", "chain": "robinhood", "http_calls": 0}
     return run_robinhood_radar_incremental(
         cfg.output_dir,
         cfg.state_dir,
@@ -59,10 +71,13 @@ def _robinhood_discovery(cfg: Settings, *, ttl_seconds: int) -> dict:
         chunk_blocks=env_int("PEIXAO_ROBINHOOD_LOG_CHUNK_BLOCKS", 10000),
         max_logs_per_token=env_int("PEIXAO_ROBINHOOD_MAX_LOGS_PER_TOKEN", 1200),
         max_rps=env_float("PEIXAO_ROBINHOOD_MAX_RPS", 15.0),
+        prefer_free_rpc=env_bool("PEIXAO_ROBINHOOD_PREFER_FREE_RPC", bool(cost_int("PEIXAO_ROBINHOOD_PREFER_FREE_RPC"))),
     )
 
 
 def _solana_token_radar(cfg: Settings, *, ttl_seconds: int) -> dict:
+    if not cfg.chain_enabled("solana"):
+        return {"status": "CHAIN_DISABLED", "chain": "solana", "http_calls": 0}
     return run_token_radar(
         cfg.output_dir,
         cfg.state_dir,
@@ -127,30 +142,54 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         top_ready=top_ready,
     )
 
-    # Legacy Robinhood rotation remains gradual and cache-aware.
-    legacy_robinhood_nansen = safe_call("legacy_robinhood_provider_rotation", lambda: enrich_legacy_robinhood_rotating(
-        cfg.output_dir / "V6_wallet_queue_enriched.csv",
-        cfg.output_dir / "V22_legacy_robinhood_wallet_enriched.csv",
-        cfg.state_dir,
-        api_key=cfg.nansen_api_key,
-        zerion_api_key=cfg.zerion_api_key,
-        timeout=max(cfg.rpc_timeout, 15.0),
-        lookback_days=30,
-        batch_size=env_int("PEIXAO_LEGACY_NANSEN_BATCH", 20),
-        zerion_batch_size=env_int("PEIXAO_LEGACY_ZERION_BATCH", 40),
-        retry_cooldown_seconds=86400,
-    ))
+    # Rotação legada Robinhood: gradual, cache primeiro, lotes dentro do teto
+    # diário de cada provedor (lote 0 ainda aplica o cache de graça).
+    def _legacy_rotation() -> dict:
+        # Robinhood desligada em PEIXAO_CHAINS: só aplica cache (lote 0).
+        active = cfg.chain_enabled("robinhood")
+        nansen_batch = 0 if not active else budgeted_batch(
+            cfg.master_db, "NANSEN", cost_int("PEIXAO_LEGACY_NANSEN_BATCH"), units_per_item=UNITS_PER_WALLET["NANSEN"],
+        )
+        zerion_batch = 0 if not active else budgeted_batch(
+            cfg.master_db, "ZERION", cost_int("PEIXAO_LEGACY_ZERION_BATCH"), units_per_item=UNITS_PER_WALLET["ZERION"],
+        )
+        result = enrich_legacy_robinhood_rotating(
+            cfg.output_dir / "V6_wallet_queue_enriched.csv",
+            cfg.output_dir / "V22_legacy_robinhood_wallet_enriched.csv",
+            cfg.state_dir,
+            api_key=cfg.nansen_api_key,
+            zerion_api_key=cfg.zerion_api_key,
+            timeout=max(cfg.rpc_timeout, 15.0),
+            lookback_days=30,
+            batch_size=nansen_batch,
+            zerion_batch_size=zerion_batch,
+            retry_cooldown_seconds=86400,
+        )
+        record_spend(cfg.master_db, "NANSEN", float(result.get("nansen_http_calls", 0) or 0), chain="robinhood", stage="legacy_rotation")
+        record_spend(cfg.master_db, "ZERION", float(result.get("zerion_http_calls", 0) or 0), chain="robinhood", stage="legacy_rotation")
+        return result
 
-    legacy_robinhood_coinstats = safe_call("legacy_robinhood_coinstats", lambda: enrich_coinstats_fallback(
-        cfg.output_dir / "V22_legacy_robinhood_wallet_enriched.csv",
-        cfg.state_dir,
-        api_key=cfg.coinstats_api_key,
-        chain="robinhood",
-        timeout=max(cfg.rpc_timeout, 15.0),
-        lookback_days=30,
-        max_batch_size=env_int("PEIXAO_COINSTATS_BATCH", 8),
-        retry_cooldown_seconds=86400,
-    ))
+    legacy_robinhood_nansen = safe_call("legacy_robinhood_provider_rotation", _legacy_rotation)
+
+    def _coinstats(remaining) -> dict:
+        batch = cost_int("PEIXAO_COINSTATS_BATCH")
+        if remaining is not None:
+            batch = min(batch, int(remaining // UNITS_PER_WALLET["COINSTATS"]))
+        return enrich_coinstats_fallback(
+            cfg.output_dir / "V22_legacy_robinhood_wallet_enriched.csv",
+            cfg.state_dir,
+            api_key=cfg.coinstats_api_key,
+            chain="robinhood",
+            timeout=max(cfg.rpc_timeout, 15.0),
+            lookback_days=30,
+            max_batch_size=max(0, batch),
+            retry_cooldown_seconds=86400,
+        )
+
+    legacy_robinhood_coinstats = safe_call("legacy_robinhood_coinstats", lambda: run_paid_step(
+        cfg.master_db, "COINSTATS", "legacy_coinstats", _coinstats,
+        units_from=http_calls, chain="robinhood", min_units=UNITS_PER_WALLET["COINSTATS"],
+    ) if cfg.coinstats_api_key and cfg.chain_enabled("robinhood") else {"status": "SKIPPED", "http_calls": 0})
 
     if not cfg.token_radar_enabled:
         result["legacy_robinhood_nansen"] = legacy_robinhood_nansen
@@ -170,7 +209,6 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         cfg.output_dir, cfg.state_dir, cfg.master_db, stale_seconds=_queue_ttl(),
     ))
 
-    live_nansen_per_chain = env_int("PEIXAO_NANSEN_WALLETS_PER_CHAIN", 20)
     base_priority = first_existing(
         cfg.output_dir / "V22_base_wallet_priority.csv",
         cfg.output_dir / "V22_base_wallet_candidates.csv",
@@ -179,29 +217,11 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         cfg.output_dir / "V22_robinhood_wallet_priority.csv",
         cfg.output_dir / "V22_robinhood_wallet_candidates.csv",
     )
-
-    base_nansen = safe_call("base_nansen_pnl", lambda: enrich_nansen_pnl_priority(
-        base_priority,
-        cfg.output_dir / "V22_base_wallet_enriched.csv",
-        cfg.state_dir,
-        api_key=cfg.nansen_api_key,
-        chain="base",
-        timeout=max(cfg.rpc_timeout, 15.0),
-        lookback_days=30,
-        ttl_seconds=cfg.birdeye_pnl_ttl_seconds,
-        max_wallets=live_nansen_per_chain,
+    base_nansen = safe_call("base_nansen_pnl", lambda: run_nansen_priority(
+        cfg, "base", base_priority, max_wallets=cfg.nansen_wallets_per_chain,
     ))
-
-    robinhood_nansen = safe_call("robinhood_nansen_pnl", lambda: enrich_nansen_pnl_priority(
-        robinhood_priority,
-        cfg.output_dir / "V22_robinhood_wallet_enriched.csv",
-        cfg.state_dir,
-        api_key=cfg.nansen_api_key,
-        chain="robinhood",
-        timeout=max(cfg.rpc_timeout, 15.0),
-        lookback_days=30,
-        ttl_seconds=cfg.birdeye_pnl_ttl_seconds,
-        max_wallets=live_nansen_per_chain,
+    robinhood_nansen = safe_call("robinhood_nansen_pnl", lambda: run_nansen_priority(
+        cfg, "robinhood", robinhood_priority, max_wallets=cfg.nansen_wallets_per_chain,
     ))
 
     # Única tabela final (com Dune, identidade chain:address e unidades normalizadas).

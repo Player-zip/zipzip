@@ -8,6 +8,7 @@ from .evidence_ledger import (
     CACHE_SYNCED_PROVIDERS,
     DEFAULT_EVIDENCE_MAX_AGE_DAYS,
     DEFAULT_EVIDENCE_RETENTION_DAYS,
+    ROW_METHODOLOGY,
     _connect,
     canonical_metrics_for_wallet,
     normalize_address,
@@ -70,9 +71,9 @@ def _row_provider(row: dict) -> str:
     """Provedor usado para gravar a linha do pipeline no ledger.
 
     Uma linha pode misturar campos do GMGN com lacunas preenchidas por
-    Nansen/Zerion/CoinStats. Esses três já entram no ledger pelos próprios
-    caches (com data e atribuição corretas), então a linha mista entra como
-    INLINE, a menor prioridade, em vez de herdar a prioridade do provedor.
+    Nansen/Zerion/CoinStats/Birdeye. Esses provedores já entram no ledger pelos
+    próprios caches (com data e atribuição corretas), então a linha mista entra
+    como INLINE, a menor prioridade, em vez de herdar a prioridade do provedor.
     """
     provider = _provider(row)
     return "INLINE" if provider in CACHE_SYNCED_PROVIDERS else provider
@@ -149,7 +150,7 @@ def build_chain_aware_inputs(
                 metrics=metrics,
                 observed_at=str(row.get("observed_at") or row.get("updated_at") or "") or None,
                 window_days=30,
-                methodology="pipeline source row",
+                methodology=ROW_METHODOLOGY,
                 source_quality=0.75,
                 conn=conn,
             )

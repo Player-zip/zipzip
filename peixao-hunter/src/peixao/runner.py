@@ -6,13 +6,14 @@ from .alpha_db import record_alpha22_stage1_csv
 from .alpha_v22 import build_alpha_v22_stage1
 from .birdeye_alpha import run_birdeye_alpha_discovery
 from .config import settings, Settings
+from .cost_control import UNITS_PER_WALLET, dune_executions, http_calls, run_paid_step
 from .dune import probe_dune
 from .dune_selectivity import enrich_stage1_with_dune
 from .gmgn_live import probe_gmgn_live
 from .jupiter import probe_jupiter
 from .mobula import probe_mobula
 from .rpc_budget import RpcBudgetManager
-from .quicknode_solana import merge_quicknode_with_birdeye, quicknode_solana_enabled, run_quicknode_solana_from_settings
+from .quicknode_solana import merge_quicknode_with_birdeye, quicknode_solana_enabled, run_quicknode_solana_budgeted
 from .solana_tracker import probe_solana_tracker
 from .selective_alpha import build_selective_stage1
 from .state import PipelineState, logger, utc_now
@@ -191,18 +192,29 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
 
     quicknode_enabled = quicknode_solana_enabled()
     if quicknode_enabled:
-        quicknode_summary = optional_stage("09b_quicknode_solana", lambda: run_quicknode_solana_from_settings(cfg))
+        quicknode_summary = optional_stage("09b_quicknode_solana", lambda: run_quicknode_solana_budgeted(cfg))
     else:
         quicknode_summary = {"status": "DISABLED", "rpc_calls": 0, "quicknode_credits": 0}
 
-    if cfg.birdeye_alpha_enabled:
-        birdeye_alpha_summary = optional_stage("10_birdeye_alpha_discovery", lambda: run_birdeye_alpha_discovery(
+    def _birdeye(remaining) -> dict:
+        # Lote de PnL cabe no que resta do teto (top traders: 1 chamada por token).
+        max_pnl = cfg.birdeye_max_pnl_wallets
+        if remaining is not None:
+            spare = max(0.0, remaining - cfg.birdeye_alpha_max_tokens)
+            max_pnl = min(max_pnl, int(spare // UNITS_PER_WALLET["BIRDEYE"]))
+        return run_birdeye_alpha_discovery(
             cfg.output_dir / "V22_token_radar_shortlist.csv", cfg.output_dir, cfg.state_dir,
             api_key=cfg.birdeye_api_key, base_url=cfg.birdeye_base_url,
             timeout=cfg.birdeye_alpha_timeout, delay=cfg.birdeye_alpha_delay,
             max_tokens=cfg.birdeye_alpha_max_tokens, top_traders_per_token=cfg.birdeye_top_traders_per_token,
-            min_cross_token_hits=cfg.birdeye_min_cross_token_hits, max_pnl_wallets=cfg.birdeye_max_pnl_wallets,
+            min_cross_token_hits=cfg.birdeye_min_cross_token_hits, max_pnl_wallets=max(0, max_pnl),
             top_trader_ttl_seconds=cfg.birdeye_top_trader_ttl_seconds, pnl_ttl_seconds=cfg.birdeye_pnl_ttl_seconds,
+        )
+
+    if cfg.birdeye_alpha_enabled and cfg.chain_enabled("solana"):
+        birdeye_alpha_summary = optional_stage("10_birdeye_alpha_discovery", lambda: run_paid_step(
+            cfg.master_db, "BIRDEYE", "birdeye_alpha", _birdeye,
+            units_from=http_calls, chain="solana", min_units=float(cfg.birdeye_alpha_max_tokens),
         ))
     else:
         birdeye_alpha_summary = {"status": "DISABLED", "http_calls": 0}
@@ -226,12 +238,15 @@ def run_v6(*, cfg: Settings = settings, validate_against_reference: bool = True,
         max_deep_dive=30,
     ))
 
-    dune_selective_summary = optional_stage("12_dune_selectivity_validation", lambda: enrich_stage1_with_dune(
-        cfg.output_dir / "V22S_pre_dune_wallet_stage1.csv", cfg.output_dir, cfg.state_dir,
-        api_key=cfg.dune_api_key, enabled=cfg.dune_selectivity_enabled,
-        base_url=cfg.dune_base_url.rstrip("/") + "/api/v1", timeout=max(cfg.dune_timeout, 15.0),
-        ttl_seconds=cfg.dune_selectivity_ttl_seconds, max_wallets=cfg.dune_selectivity_max_wallets,
-        lookback_days=cfg.dune_selectivity_lookback_days, max_poll_seconds=cfg.dune_selectivity_poll_seconds,
+    dune_selective_summary = optional_stage("12_dune_selectivity_validation", lambda: run_paid_step(
+        cfg.master_db, "DUNE", "dune_selectivity", lambda remaining: enrich_stage1_with_dune(
+            cfg.output_dir / "V22S_pre_dune_wallet_stage1.csv", cfg.output_dir, cfg.state_dir,
+            api_key=cfg.dune_api_key, enabled=cfg.dune_selectivity_enabled and cfg.chain_enabled("solana"),
+            base_url=cfg.dune_base_url.rstrip("/") + "/api/v1", timeout=max(cfg.dune_timeout, 15.0),
+            ttl_seconds=cfg.dune_selectivity_ttl_seconds, max_wallets=cfg.dune_selectivity_max_wallets,
+            lookback_days=cfg.dune_selectivity_lookback_days, max_poll_seconds=cfg.dune_selectivity_poll_seconds,
+        ),
+        units_from=dune_executions, chain="solana",
     ))
 
     # A tabela final (V22S_wallet_stage1.csv), o registro no banco e os alertas

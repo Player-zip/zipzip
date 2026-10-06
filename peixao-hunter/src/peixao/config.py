@@ -48,6 +48,94 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+# ---------------------------------------------------------------------------
+# Perfis de custo. "economy" (padrão) minimiza chamadas a APIs/RPCs pagos;
+# "balanced" reproduz os volumes anteriores. Qualquer variável explícita no
+# ambiente vence o perfil.
+# ---------------------------------------------------------------------------
+COST_PROFILES: dict[str, dict[str, float]] = {
+    "economy": {
+        "PEIXAO_NANSEN_WALLETS_PER_CHAIN": 5,
+        "PEIXAO_NANSEN_TTL_SECONDS": 3 * 86400,
+        "PEIXAO_NANSEN_RETRY_SECONDS": 3 * 86400,
+        "PEIXAO_MONITOR_REFRESH_SECONDS": 7 * 86400,
+        "PEIXAO_LEGACY_NANSEN_BATCH": 5,
+        "PEIXAO_LEGACY_ZERION_BATCH": 10,
+        "PEIXAO_COINSTATS_BATCH": 4,
+        "PEIXAO_BIRDEYE_ALPHA_MAX_TOKENS": 3,
+        "PEIXAO_BIRDEYE_TOP_TRADERS_PER_TOKEN": 20,
+        "PEIXAO_BIRDEYE_MAX_PNL_WALLETS": 10,
+        "PEIXAO_BIRDEYE_TOP_TRADER_TTL": 86400,
+        "PEIXAO_BIRDEYE_PNL_TTL": 3 * 86400,
+        "PEIXAO_QUICKNODE_DAILY_CREDITS": 60_000,
+        "PEIXAO_QUICKNODE_RUN_CREDITS": 20_000,
+        "PEIXAO_QUICKNODE_CACHE_TTL": 6 * 3600,
+        "PEIXAO_QUICKNODE_FAST_CYCLE": 0,
+        "PEIXAO_DUNE_SELECTIVITY_TTL": 3 * 86400,
+        "PEIXAO_DUNE_SELECTIVITY_MAX_WALLETS": 10,
+        "PEIXAO_BASE_WALLET_TTL": 6 * 3600,
+        "PEIXAO_ROBINHOOD_PREFER_FREE_RPC": 1,
+        "PEIXAO_PAID_MIN_PRIORITY": 45,
+        "PEIXAO_DAILY_CAP_NANSEN": 250,
+        "PEIXAO_DAILY_CAP_BIRDEYE": 200,
+        "PEIXAO_DAILY_CAP_ZERION": 100,
+        "PEIXAO_DAILY_CAP_COINSTATS": 60,
+        "PEIXAO_DAILY_CAP_DUNE": 1,
+        "PEIXAO_RPC_DAILY_LIMIT_ALCHEMY": 3000,
+        "PEIXAO_RPC_DAILY_LIMIT_QUICKNODE_EVM": 5000,
+        "PEIXAO_RPC_DAILY_LIMIT_DRPC": 20000,
+        "PEIXAO_RPC_DAILY_LIMIT_ROBINHOOD_RPC": 50000,
+    },
+    "balanced": {
+        "PEIXAO_NANSEN_WALLETS_PER_CHAIN": 20,
+        "PEIXAO_NANSEN_TTL_SECONDS": 86400,
+        "PEIXAO_NANSEN_RETRY_SECONDS": 6 * 3600,
+        "PEIXAO_MONITOR_REFRESH_SECONDS": 86400,
+        "PEIXAO_LEGACY_NANSEN_BATCH": 20,
+        "PEIXAO_LEGACY_ZERION_BATCH": 40,
+        "PEIXAO_COINSTATS_BATCH": 8,
+        "PEIXAO_BIRDEYE_ALPHA_MAX_TOKENS": 5,
+        "PEIXAO_BIRDEYE_TOP_TRADERS_PER_TOKEN": 30,
+        "PEIXAO_BIRDEYE_MAX_PNL_WALLETS": 20,
+        "PEIXAO_BIRDEYE_TOP_TRADER_TTL": 43200,
+        "PEIXAO_BIRDEYE_PNL_TTL": 86400,
+        "PEIXAO_QUICKNODE_DAILY_CREDITS": 330_000,
+        "PEIXAO_QUICKNODE_RUN_CREDITS": 75_000,
+        "PEIXAO_QUICKNODE_CACHE_TTL": 3600,
+        "PEIXAO_QUICKNODE_FAST_CYCLE": 1,
+        "PEIXAO_DUNE_SELECTIVITY_TTL": 86400,
+        "PEIXAO_DUNE_SELECTIVITY_MAX_WALLETS": 20,
+        "PEIXAO_BASE_WALLET_TTL": 1800,
+        "PEIXAO_ROBINHOOD_PREFER_FREE_RPC": 0,
+        "PEIXAO_PAID_MIN_PRIORITY": 0,
+        "PEIXAO_DAILY_CAP_NANSEN": 0,
+        "PEIXAO_DAILY_CAP_BIRDEYE": 0,
+        "PEIXAO_DAILY_CAP_ZERION": 0,
+        "PEIXAO_DAILY_CAP_COINSTATS": 0,
+        "PEIXAO_DAILY_CAP_DUNE": 0,
+        "PEIXAO_RPC_DAILY_LIMIT_ALCHEMY": 50000,
+        "PEIXAO_RPC_DAILY_LIMIT_QUICKNODE_EVM": 50000,
+        "PEIXAO_RPC_DAILY_LIMIT_DRPC": 50000,
+        "PEIXAO_RPC_DAILY_LIMIT_ROBINHOOD_RPC": 50000,
+    },
+}
+
+
+def cost_mode() -> str:
+    mode = str(os.getenv("PEIXAO_COST_MODE", "economy") or "economy").strip().lower()
+    return mode if mode in COST_PROFILES else "economy"
+
+
+def cost_default(name: str, fallback: float = 0):
+    """Padrão do perfil de custo ativo para ``name``."""
+    return COST_PROFILES[cost_mode()].get(name, fallback)
+
+
+def cost_int(name: str) -> int:
+    """Valor efetivo: ambiente, senão o padrão do perfil de custo."""
+    return _int_env(name, int(cost_default(name)))
+
+
 def env_int(name: str, default: int) -> int:
     """Leitura tolerante de inteiros fora do ``Settings`` (mesma regra)."""
     return _int_env(name, default)
@@ -138,12 +226,12 @@ class Settings:
 
     birdeye_base_url: str = os.getenv("PEIXAO_BIRDEYE_BASE_URL", "https://public-api.birdeye.so")
     birdeye_alpha_enabled: bool = _bool_env("PEIXAO_BIRDEYE_ALPHA", True)
-    birdeye_alpha_max_tokens: int = _int_env("PEIXAO_BIRDEYE_ALPHA_MAX_TOKENS", 5)
-    birdeye_top_traders_per_token: int = _int_env("PEIXAO_BIRDEYE_TOP_TRADERS_PER_TOKEN", 30)
+    birdeye_alpha_max_tokens: int = cost_int("PEIXAO_BIRDEYE_ALPHA_MAX_TOKENS")
+    birdeye_top_traders_per_token: int = cost_int("PEIXAO_BIRDEYE_TOP_TRADERS_PER_TOKEN")
     birdeye_min_cross_token_hits: int = _int_env("PEIXAO_BIRDEYE_MIN_CROSS_TOKEN_HITS", 2)
-    birdeye_max_pnl_wallets: int = _int_env("PEIXAO_BIRDEYE_MAX_PNL_WALLETS", 20)
-    birdeye_top_trader_ttl_seconds: int = _int_env("PEIXAO_BIRDEYE_TOP_TRADER_TTL", 43200)
-    birdeye_pnl_ttl_seconds: int = _int_env("PEIXAO_BIRDEYE_PNL_TTL", 86400)
+    birdeye_max_pnl_wallets: int = cost_int("PEIXAO_BIRDEYE_MAX_PNL_WALLETS")
+    birdeye_top_trader_ttl_seconds: int = cost_int("PEIXAO_BIRDEYE_TOP_TRADER_TTL")
+    birdeye_pnl_ttl_seconds: int = cost_int("PEIXAO_BIRDEYE_PNL_TTL")
     birdeye_alpha_delay: float = _float_env("PEIXAO_BIRDEYE_ALPHA_DELAY", 1.05)
     birdeye_alpha_timeout: float = _float_env("PEIXAO_BIRDEYE_ALPHA_TIMEOUT", 15)
 
@@ -152,8 +240,8 @@ class Settings:
     dune_probe_ttl_seconds: int = _int_env("PEIXAO_DUNE_PROBE_TTL", 86400)
     dune_timeout: float = _float_env("PEIXAO_DUNE_TIMEOUT", 10)
     dune_selectivity_enabled: bool = _bool_env("PEIXAO_DUNE_SELECTIVITY", True)
-    dune_selectivity_ttl_seconds: int = _int_env("PEIXAO_DUNE_SELECTIVITY_TTL", 86400)
-    dune_selectivity_max_wallets: int = _int_env("PEIXAO_DUNE_SELECTIVITY_MAX_WALLETS", 20)
+    dune_selectivity_ttl_seconds: int = cost_int("PEIXAO_DUNE_SELECTIVITY_TTL")
+    dune_selectivity_max_wallets: int = cost_int("PEIXAO_DUNE_SELECTIVITY_MAX_WALLETS")
     dune_selectivity_lookback_days: int = _int_env("PEIXAO_DUNE_SELECTIVITY_LOOKBACK_DAYS", 30)
     dune_selectivity_poll_seconds: float = _float_env("PEIXAO_DUNE_SELECTIVITY_POLL_SECONDS", 60)
     # Idade máxima do cache Dune aplicado na tabela final (o Dune roda no ciclo de 6h).
@@ -162,6 +250,17 @@ class Settings:
     # Ledger de evidências: janela de frescor e retenção do histórico.
     evidence_max_age_days: float = _float_env("PEIXAO_EVIDENCE_MAX_AGE_DAYS", 30)
     evidence_retention_days: float = _float_env("PEIXAO_EVIDENCE_RETENTION_DAYS", 120)
+
+    # Perfil de custo e redes ativas (rede desligada não gasta API paga).
+    cost_mode: str = cost_mode()
+    chains: tuple[str, ...] = tuple(
+        c.strip().lower() for c in (os.getenv("PEIXAO_CHAINS") or "solana,base,robinhood").split(",") if c.strip()
+    )
+    nansen_wallets_per_chain: int = cost_int("PEIXAO_NANSEN_WALLETS_PER_CHAIN")
+    nansen_ttl_seconds: int = cost_int("PEIXAO_NANSEN_TTL_SECONDS")
+    nansen_retry_seconds: int = cost_int("PEIXAO_NANSEN_RETRY_SECONDS")
+    monitor_refresh_seconds: int = cost_int("PEIXAO_MONITOR_REFRESH_SECONDS")
+    paid_min_priority: float = _float_env("PEIXAO_PAID_MIN_PRIORITY", cost_default("PEIXAO_PAID_MIN_PRIORITY"))
 
     robinhood_rpc_url: str | None = os.getenv("ROBINHOOD_RPC_URL")
     quicknode_rpc_url: str | None = os.getenv("QUICKNODE_RPC_URL")
@@ -174,6 +273,12 @@ class Settings:
     telegram_auth_max_attempts: int = _int_env("PEIXAO_TELEGRAM_AUTH_MAX_ATTEMPTS", 5)
     telegram_auth_lockout_seconds: int = _int_env("PEIXAO_TELEGRAM_AUTH_LOCKOUT_SECONDS", 900)
     telegram_auth_ttl_days: float = _float_env("PEIXAO_TELEGRAM_AUTH_TTL_DAYS", 0)
+    # Chats com poder de admin (convites/revogação); separados por vírgula.
+    telegram_admin_chat_ids: tuple[str, ...] = tuple(
+        x.strip() for x in (os.getenv("TELEGRAM_ADMIN_CHAT_IDS") or "").split(",") if x.strip()
+    )
+    # Desligue para aceitar só convites individuais (sem senha compartilhada).
+    telegram_password_login: bool = _bool_env("PEIXAO_TELEGRAM_PASSWORD_LOGIN", True)
 
     gmgn_api_key: str | None = os.getenv("GMGN_API_KEY")
     gmgn_live_probe: bool = _bool_env("PEIXAO_GMGN_LIVE_PROBE", True)
@@ -192,6 +297,9 @@ class Settings:
     @property
     def cache_dir(self) -> Path:
         return self.data_dir / "cache"
+
+    def chain_enabled(self, chain: str) -> bool:
+        return str(chain or "").strip().lower() in self.chains
 
     @property
     def master_db(self) -> Path:

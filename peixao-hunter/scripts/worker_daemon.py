@@ -55,6 +55,8 @@ def telegram_auth_loop():
                 max_attempts=settings.telegram_auth_max_attempts,
                 lockout_seconds=settings.telegram_auth_lockout_seconds,
                 auth_ttl_days=settings.telegram_auth_ttl_days,
+                admin_chat_ids=settings.telegram_admin_chat_ids,
+                password_login=settings.telegram_password_login,
             )
             if auth.get("status") == "NOT_CONFIGURED":
                 log("telegram_auth_not_configured")

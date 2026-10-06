@@ -503,7 +503,14 @@ def run_robinhood_radar_incremental(
     chunk_blocks: int = 9_500,
     max_logs_per_token: int = 1200,
     max_rps: float = 15.0,
+    prefer_free_rpc: bool = False,
 ) -> dict:
+    """Descoberta de wallets Robinhood por logs de Transfer.
+
+    Ordem: RPC primário configurado -> Alchemy (pago) -> RPC público (grátis).
+    Com ``prefer_free_rpc`` (perfil economy) o RPC público incremental vem
+    antes da Alchemy, e a Alchemy só é usada se o público falhar.
+    """
     base = run_robinhood_radar(
         output_dir,
         state_dir,
@@ -555,6 +562,48 @@ def run_robinhood_radar_incremental(
                 "incremental": True,
             }
 
+    fallback_url = str(public_rpc_url or "").strip()
+
+    def _public_attempt(*, accept_empty: bool) -> dict | None:
+        if not fallback_url or fallback_url == primary_url:
+            return None
+        fallback = discover_wallets_incremental(
+            shortlist,
+            rpc_url=fallback_url,
+            output_path=wallet_path,
+            state_path=state_dir / "robinhood_incremental_public.json",
+            provider_label="ROBINHOOD_PUBLIC",
+            timeout=timeout,
+            min_cross_token_hits=min_cross_token_hits,
+            max_wallets=max_wallets,
+            bootstrap_lookback_blocks=min(lookback_blocks, 20_000),
+            chunk_blocks=min(chunk_blocks, 2_000),
+            max_logs_per_token=max_logs_per_token,
+            max_rps=min(max_rps, 5.0),
+        )
+        attempts.append(fallback)
+        succeeded = fallback.get("status") in {"DONE", "DONE_NO_NEW_BLOCKS"}
+        if int(fallback.get("wallets", 0)) > 0 or (accept_empty and succeeded):
+            return {
+                **base,
+                "status": "DONE" if succeeded else "PARTIAL",
+                "wallets": int(fallback.get("wallets", 0)),
+                "http_calls": int(base.get("http_calls", 0)),
+                "rpc_calls": int(fallback.get("rpc_calls", 0)),
+                "wallet_discovery_status": fallback.get("status"),
+                "wallet_discovery_provider": fallback.get("provider"),
+                "provider_attempts": attempts,
+                "incremental": True,
+            }
+        return None
+
+    public_tried = False
+    if prefer_free_rpc:
+        public_tried = bool(fallback_url and fallback_url != primary_url)
+        free_result = _public_attempt(accept_empty=True)
+        if free_result is not None:
+            return free_result
+
     key = str(alchemy_api_key or "").strip()
     if key:
         alchemy = run_robinhood_radar(
@@ -583,35 +632,10 @@ def run_robinhood_radar_incremental(
                 "incremental": False,
             }
 
-    fallback_url = str(public_rpc_url or "").strip()
-    if fallback_url and fallback_url != primary_url:
-        fallback = discover_wallets_incremental(
-            shortlist,
-            rpc_url=fallback_url,
-            output_path=wallet_path,
-            state_path=state_dir / "robinhood_incremental_public.json",
-            provider_label="ROBINHOOD_PUBLIC",
-            timeout=timeout,
-            min_cross_token_hits=min_cross_token_hits,
-            max_wallets=max_wallets,
-            bootstrap_lookback_blocks=min(lookback_blocks, 20_000),
-            chunk_blocks=min(chunk_blocks, 2_000),
-            max_logs_per_token=max_logs_per_token,
-            max_rps=min(max_rps, 5.0),
-        )
-        attempts.append(fallback)
-        if int(fallback.get("wallets", 0)) > 0:
-            return {
-                **base,
-                "status": "DONE" if fallback.get("status") in {"DONE", "DONE_NO_NEW_BLOCKS"} else "PARTIAL",
-                "wallets": int(fallback.get("wallets", 0)),
-                "http_calls": int(base.get("http_calls", 0)),
-                "rpc_calls": int(fallback.get("rpc_calls", 0)),
-                "wallet_discovery_status": fallback.get("status"),
-                "wallet_discovery_provider": fallback.get("provider"),
-                "provider_attempts": attempts,
-                "incremental": True,
-            }
+    if not public_tried:
+        free_result = _public_attempt(accept_empty=False)
+        if free_result is not None:
+            return free_result
 
     last = attempts[-1] if attempts else {
         "status": "NOT_CONFIGURED_RPC",

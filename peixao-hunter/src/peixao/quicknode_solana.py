@@ -770,7 +770,7 @@ def run_quicknode_solana_from_settings(cfg) -> dict:
     Antes cada ciclo tinha seus próprios padrões (25 vs 30 wallets, TTL 1800 vs
     3600) para as mesmas variáveis de ambiente.
     """
-    from .config import env_float, env_int
+    from .config import cost_int, env_float, env_int
 
     if not quicknode_solana_enabled():
         return {"status": "DISABLED", "rpc_calls": 0, "quicknode_credits": 0}
@@ -787,8 +787,22 @@ def run_quicknode_solana_from_settings(cfg) -> dict:
         max_tokens=env_int("PEIXAO_QUICKNODE_MAX_TOKENS", 5),
         max_wallets=env_int("PEIXAO_QUICKNODE_MAX_WALLETS", 30),
         tx_per_wallet=env_int("PEIXAO_QUICKNODE_TX_PER_WALLET", 80),
-        daily_credit_budget=env_int("PEIXAO_QUICKNODE_DAILY_CREDITS", 330_000),
-        run_credit_budget=env_int("PEIXAO_QUICKNODE_RUN_CREDITS", 75_000),
+        daily_credit_budget=cost_int("PEIXAO_QUICKNODE_DAILY_CREDITS"),
+        run_credit_budget=cost_int("PEIXAO_QUICKNODE_RUN_CREDITS"),
         call_credit_estimate=env_int("PEIXAO_QUICKNODE_CALL_CREDITS", 30),
-        cache_ttl_seconds=env_int("PEIXAO_QUICKNODE_CACHE_TTL", 3600),
+        cache_ttl_seconds=cost_int("PEIXAO_QUICKNODE_CACHE_TTL"),
+    )
+
+
+def run_quicknode_solana_budgeted(cfg) -> dict:
+    """QuickNode Solana respeitando rede ativa e teto diário de créditos."""
+    from .config import env_int
+    from .cost_control import quicknode_credits, run_paid_step, solana_fallback_calls
+
+    if not cfg.chain_enabled("solana"):
+        return {"status": "CHAIN_DISABLED", "chain": "solana", "quicknode_credits": 0}
+    return run_paid_step(
+        cfg.master_db, "QUICKNODE", "quicknode_solana", lambda remaining: run_quicknode_solana_from_settings(cfg),
+        units_from=quicknode_credits, extra_spend=solana_fallback_calls, chain="solana",
+        min_units=float(env_int("PEIXAO_QUICKNODE_CALL_CREDITS", 30)),
     )

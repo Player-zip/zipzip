@@ -100,6 +100,7 @@ def run_base_radar(
     min_radar_score: float = 45.0,
     min_cross_token_hits: int = 2,
     max_wallets: int = 50,
+    wallet_ttl_seconds: int = 0,
 ) -> dict:
     """Live Base radar: broad discovery -> DEX validation -> wallet recurrence.
 
@@ -236,16 +237,33 @@ def run_base_radar(
 
     key = str(alchemy_api_key or "").strip()
     alchemy_url = f"https://base-mainnet.g.alchemy.com/v2/{key}" if key else None
-    wallets = discover_wallets_from_tokens(
-        qualified,
-        chain="base",
-        chain_id=8453,
-        alchemy_rpc_url=alchemy_url,
-        output_path=wallet_path,
-        timeout=timeout,
-        min_cross_token_hits=min_cross_token_hits,
-        max_wallets=max_wallets,
+    # A descoberta de wallets usa Alchemy (pago). Mesma shortlist dentro do TTL
+    # => reaproveita o resultado anterior em vez de consultar de novo.
+    wallet_cache_path = state_dir / "base_wallet_discovery_cache.json"
+    tokens_key = "|".join(sorted(qualified["token_address"].astype(str).str.lower()))
+    wallet_cache = _load_json(wallet_cache_path)
+    wallets_cached = bool(
+        wallet_ttl_seconds > 0
+        and wallet_path.is_file()
+        and wallet_cache.get("tokens_key") == tokens_key
+        and now - int(wallet_cache.get("checked_epoch", 0) or 0) < int(wallet_ttl_seconds)
+        and isinstance(wallet_cache.get("summary"), dict)
     )
+    if wallets_cached:
+        wallets = {**wallet_cache["summary"], "http_calls": 0, "cached": True}
+    else:
+        wallets = discover_wallets_from_tokens(
+            qualified,
+            chain="base",
+            chain_id=8453,
+            alchemy_rpc_url=alchemy_url,
+            output_path=wallet_path,
+            timeout=timeout,
+            min_cross_token_hits=min_cross_token_hits,
+            max_wallets=max_wallets,
+        )
+        if wallets.get("status") in {"DONE", "DONE_EMPTY"}:
+            _atomic_json(wallet_cache_path, {"tokens_key": tokens_key, "checked_epoch": now, "summary": wallets})
 
     return {
         "status": "DONE" if wallets.get("status") in {"DONE", "DONE_EMPTY", "NOT_CONFIGURED_ALCHEMY"} else "PARTIAL",
@@ -254,6 +272,8 @@ def run_base_radar(
         "shortlisted": int(len(qualified)),
         "wallets": int(wallets.get("wallets", 0)),
         "http_calls": int(http_calls + wallets.get("http_calls", 0)),
+        "alchemy_calls": int(wallets.get("http_calls", 0) or 0),
+        "wallet_discovery_cached": bool(wallets_cached),
         "source_counts": source_counts,
         "wallet_discovery_status": wallets.get("status"),
         "output": str(out_path),

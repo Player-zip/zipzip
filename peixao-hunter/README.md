@@ -51,8 +51,49 @@ O `scripts/worker_daemon.py` roda:
 - as métricas passam pelo ledger de evidências (`evidence_ledger.py`), com unidades normalizadas (taxas sempre em razão: `0.65 = 65%`) e janela de frescor;
 - a validação Dune entra pelo cache.
 
+## Custo: perfil `economy` (padrão)
+
+O objetivo é gastar o mínimo possível com APIs e RPCs pagos. `PEIXAO_COST_MODE=economy` é o padrão; `balanced` volta aos volumes anteriores. Qualquer variável definida explicitamente no ambiente vence o perfil.
+
+| Onde gastava | O que mudou no `economy` |
+|---|---|
+| Nansen | até 5 wallets/rede/hora (antes 20); cache de 3 dias; wallet que falhou não é consultada de novo por 3 dias; só gasta com wallet de prioridade ≥ 45 na fila; wallet já pontuada é revisitada a cada 7 dias; teto de 250 chamadas/dia |
+| QuickNode Solana | roda só no ciclo de 6h (antes também a cada 30 min); 60k créditos/dia (antes 330k); cache de 6h |
+| Alchemy (Base) | descoberta de wallets reaproveitada por 6h quando a shortlist não muda (antes refazia a cada 30 min); teto de 3.000 chamadas/dia |
+| Alchemy (Robinhood) | RPC público incremental (grátis) primeiro; Alchemy só se ele falhar |
+| Birdeye | 3 tokens / 20 top traders / 10 PnL por rodada (antes 5/30/20); cache de PnL de 3 dias; teto de 200 chamadas/dia |
+| Dune | 10 wallets por execução, cache de 3 dias, no máximo 1 execução/dia |
+| Zerion / CoinStats | lotes de 10 / 4 (antes 40 / 8); tetos de 100 / 60 chamadas/dia |
+
+Como funciona:
+- **Teto diário fail-closed:** cada etapa paga registra o consumo real (tabela `provider_spend`). Se o teto do dia acabou, a etapa é pulada até a virada do dia (UTC). Lotes são dimensionados para caber no que resta.
+- **Redes:** `PEIXAO_CHAINS` liga e desliga redes inteiras. Rede fora da lista não gasta API paga.
+- **`/status`:** mostra o gasto das últimas 24h por provedor contra o teto, o uso de RPC do dia e o **custo por wallet alpha nova** (7 dias).
+
+## Backtest honesto (sem custo de API)
+
+Cada vez que uma wallet atinge um tier pela primeira vez, o sistema grava um sinal imutável com a foto do momento. Em 7, 14 e 30 dias ele procura no ledger a primeira observação **real** de provedor (data de consulta do cache Nansen/Zerion/CoinStats/Birdeye) depois do horizonte.
+
+- **Sem viés de sobrevivência:** wallets que saíram da tabela também são avaliadas. Sinal sem observação conta como `NO_OBSERVATION` e aparece na cobertura.
+- **Controle:** os tiers C/D servem de grupo de comparação.
+- **Fora da amostra:** no horizonte de 30 dias, a janela "30d" do provedor cobre só o período depois do sinal.
+- **Onde aparece:** no `/status`, em cada alerta (histórico do tier) e em `V23_score_outcomes_summary.csv`.
+- **Custo:** nenhuma chamada extra. A cobertura depende das revisitas que o pipeline já faz.
+
+## Acesso ao bot
+
+| Forma | Como funciona |
+|---|---|
+| Senha compartilhada (`TELEGRAM_ACCESS_PASSWORD`) | Plano `pro`. Trocar a senha revoga essas sessões. Desligue com `PEIXAO_TELEGRAM_PASSWORD_LOGIN=false`. |
+| Convite individual | Um admin gera com `/convite [pro\|basico] [dias]`. O código é de uso único, vale 7 dias para resgate e não depende da senha. |
+| Admin (`TELEGRAM_ADMIN_CHAT_IDS`) | Sempre autorizado. Comandos: `/convite`, `/usuarios`, `/revogar <chat_id>`. |
+
+O plano `pro` recebe os alertas automáticos; o `basico` só consulta `/status` e `/wallets_bs`.
+
 ## Mudanças de comportamento desta versão
 
+- **Perfil `economy` é o padrão** e reduz bastante o volume de chamadas pagas (tabela acima). Para voltar aos volumes antigos: `PEIXAO_COST_MODE=balanced`. O `.env.example` deixa as variáveis de custo comentadas de propósito, para não anular o perfil.
+- **Backtest antigo substituído:** o `backtest_v23` (fotos de hora em hora, só wallets ainda na tabela) deu lugar ao `score_outcomes`. As tabelas antigas ficam no banco, sem uso.
 - **Login do Telegram:** após `PEIXAO_TELEGRAM_AUTH_MAX_ATTEMPTS` senhas erradas o chat fica bloqueado por `PEIXAO_TELEGRAM_AUTH_LOCKOUT_SECONDS`.
   - A mensagem com a senha é apagada do chat.
   - **Trocar `TELEGRAM_ACCESS_PASSWORD` revoga todas as sessões.** Sessões que já existiam ficam presas à senha vigente no primeiro start; troque a senha depois do deploy se quiser derrubá-las.

@@ -7,7 +7,10 @@ import os
 
 import pandas as pd
 
+from .config import cost_mode
+from .cost_control import spend_report
 from .evidence_ledger import provider_health, record_provider_run
+from .score_outcomes import SUMMARY_FILE
 
 
 def _now() -> str:
@@ -83,6 +86,50 @@ def _waiting_reasons(stage: pd.DataFrame) -> dict:
     return reasons
 
 
+def _new_alpha_signals(db_path: Path, *, days: int = 7) -> int:
+    import sqlite3
+    import time
+
+    if not db_path.is_file():
+        return 0
+    cutoff = int(time.time()) - days * 86400
+    try:
+        with sqlite3.connect(db_path, timeout=30) as conn:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT wallet_key) FROM score_signals WHERE tier IN ('S','A+','A') AND signal_epoch >= ?",
+                (cutoff,),
+            ).fetchone()
+    except sqlite3.Error:
+        return 0
+    return int(row[0] or 0) if row else 0
+
+
+def _cost_snapshot(db_path: Path) -> dict:
+    """Gasto 24h/7d por provedor pago, uso de RPC hoje e custo por alpha nova."""
+    from .rpc_budget import daily_limiter
+
+    spend_24h = spend_report(db_path, hours=24)
+    spend_7d = spend_report(db_path, hours=7 * 24)
+    try:
+        rpc_today = daily_limiter().usage_today()
+    except Exception:
+        rpc_today = {}
+    new_alpha = _new_alpha_signals(db_path, days=7)
+    per_alpha = {
+        provider: round(item["units"] / new_alpha, 2)
+        for provider, item in spend_7d.items()
+        if new_alpha and item.get("units")
+    }
+    return {
+        "mode": cost_mode(),
+        "spend_24h": spend_24h,
+        "spend_7d": spend_7d,
+        "rpc_today": rpc_today,
+        "new_alpha_7d": new_alpha,
+        "cost_per_new_alpha_7d": per_alpha,
+    }
+
+
 def publish_efficiency_snapshot(
     *,
     output_dir: Path,
@@ -114,7 +161,8 @@ def publish_efficiency_snapshot(
         item["calls_per_enriched"] = None if not enriched else round(calls / enriched, 3)
         health[provider.lower()] = item
 
-    backtest_frame = _read(output_dir / "V22_backtest_summary.csv")
+    backtest_frame = _read(output_dir / SUMMARY_FILE)
+    cost = _cost_snapshot(db_path)
     payload = {
         "version": "V2.3-DELTA",
         "updated_at": _now(),
@@ -131,7 +179,8 @@ def publish_efficiency_snapshot(
         "providers_24h": health,
         "adaptive_queue": adaptive_queue or {},
         "backtest": backtest or {},
-        "backtest_summary_rows": backtest_frame.to_dict("records")[:12] if not backtest_frame.empty else [],
+        "backtest_summary_rows": backtest_frame.to_dict("records") if not backtest_frame.empty else [],
+        "cost": cost,
     }
     path = state_dir / "enrichment_efficiency.json"
     _atomic_json(path, payload)

@@ -209,6 +209,8 @@ def rpc_provider_for_url(url: str | None) -> str:
 
 
 def daily_limit_for(provider: str) -> int:
+    from .config import cost_default
+
     name = "PEIXAO_RPC_DAILY_LIMIT_" + str(provider).upper()
     raw = os.getenv(name, "").strip()
     if raw:
@@ -216,7 +218,7 @@ def daily_limit_for(provider: str) -> int:
             return max(0, int(float(raw)))
         except ValueError:
             pass
-    return int(DEFAULT_DAILY_LIMITS.get(str(provider), 50_000))
+    return int(cost_default(name, DEFAULT_DAILY_LIMITS.get(str(provider), 50_000)))
 
 
 class DailyCallLimiter:
